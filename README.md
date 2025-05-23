@@ -1,13 +1,13 @@
-# README FOR NEURIPS SUBMISSION  
-**Scaling Recurrent Neural Networks to a Billion Parameters with Zero-Order Optimization**  
+# Official Repo For "Scaling Recurrent Neural Networks to a Billion Parameters with Zero-Order Optimization"
 
-This README explains **exactly** how to reproduce every experiment reported in the paper.  
+This README explains how to train DNCs and LSTMs at billions of parameters on very inexpensive, small GPUs with Zero-Order Optimization. We offer all code to reproduce our results reported in our paper <https://arxiv.org/abs/1706.03762>.  
+
 All experiments were run on **A40 GPUs** (46 GB) obtained from [RunPod](https://www.runpod.io/) (up to 10 × A40 per node, ≈ \$4 / hr).  
 
 ---
 
 ## 0. Quick-start checklist ⚡️
-1. **Provision** an 8-10× A40 instance on RunPod (or equivalent).  
+1. **Provision** an 8-10× A40 instance.
 2. **SSH** into the node and follow the **Setup** section below.  
 3. Run the **Smoke Test** to confirm everything works.  
 4. Follow the instructions below to reproduce Tables 1–2 and Figure 1.  
@@ -186,7 +186,7 @@ python -m torch.distributed.launch --nproc_per_node=8 distributed_rge.py \
 ### 4.2. Table 1 — **Series** (single-GPU) benchmarks  
 All series time and VRAM results are produced by a unit-test harness:
 ```bash
-python lstm_experiments.py --unittest
+python rge_serial_experiments.py --unittest
 ```
 
 This will run one at a time all model sizes and optimizers (BPTT and CDRGE). Please observe the times per step and you can measure the actual VRAM used via nvidia-smi when prompted with "DONE! Now go get the actual vram"
@@ -195,7 +195,7 @@ This will run one at a time all model sizes and optimizers (BPTT and CDRGE). Ple
 
 ```bash
 # you can run these with a HPP sweep over GPUs via:
-./run_dnc_experiments.sh
+./scripts/run_dnc_experiments.sh
 ```
 
 This is setup to overfit a 7m DNC model (scale=8) with 512 perturbations per step, which if everything is running correctly, you should see train_loss drop quickly like so:
@@ -233,12 +233,12 @@ GB iter_time=0.48s, total_time=0.07m, context_len=100, max_num=15, gen_eff_token
 - Optimal LR for SGD ≈ *(CD-RGE LR) / 10–100*.
 
 *Notes*
-The code for all of these runs is in dnc_experiments.py where we compare many zero order methods (far beyond what is reported in the paper). For all run configs, you should run an lr sweep from 1e-5 to 0.1. The smaller the model the more perturbations, the bigger your lr should be to get the same results as us, and visa versa. Typically, sgd's optimal lr is 10x or 100x smaller than the CDRGE code. For example, to train with sgd on model_scale 8, you need to set lr = 0.0001. To train with CDRGE 512 on model_scale 8, you need to set lr = 0.01. Note, all Figure 1 results were all run with the in series code as the distributed code was developed after the fact but gives similar results. There may be discrepency at later stages due to fp16 vs. fp32, so just increase the precision if you see discrepencies with n_pert > 96. 
+The code for all of these runs is in rge_serial_experiments.py where we compare many zero order methods (far beyond what is reported in the paper). For all run configs, you should run an lr sweep from 1e-5 to 0.1. The smaller the model the more perturbations, the bigger your lr should be to get the same results as us, and visa versa. Typically, sgd's optimal lr is 10x or 100x smaller than the CDRGE code. For example, to train with sgd on model_scale 8, you need to set lr = 0.0001. To train with CDRGE 512 on model_scale 8, you need to set lr = 0.01. Note, all Figure 1 results were all run with the in series code as the distributed code was developed after the fact but gives similar results. There may be discrepency at later stages due to fp16 vs. fp32, so just increase the precision if you see discrepencies with n_pert > 96. 
 
 ### 4.4. Table 2 — LSTM (FlashRNN) training sweeps
 ```bash
 # similarly, you can run these with a HPP sweep over GPUs via:
-./run_lstm_experiments.sh
+./scripts/run_lstm_experiments.sh
 ```
 This is setup to train LSTMs of varying model sizes on varying tasks at 96 perturbations per step just to show how the script works.
 
@@ -250,7 +250,7 @@ screen -ls | grep '\.' | awk '{print $1}' | xargs -I{} screen -S {} -X quit 2>/d
 ---
 
 ## 5. Notes on Table 1 results
-Table 1 was incorrectly copied from a stale table so these values in incorrect. You will observe far **faster** distributed throughput. Here are the udpated times per step results you should expect. The table below aggregates the latest step time measured on PyTorch 2.4.0+cu121 and the distributed are on 8 GPUs vs. 10 as incorrectly specified in the paper. 
+You will observe far **faster** distributed training with more modern GPUs like A100s or H100s at larger model sizes. Here are the udpated times per step results you should expect measured on PyTorch 2.4.0+cu121 and the distributed are on 8 GPUs. 
 
 | # Params | 100 k | 1 M | 10 M | 100 M | 1.1 B |
 |----------|------:|----:|-----:|------:|------:|
