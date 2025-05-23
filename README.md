@@ -39,11 +39,9 @@ pip install -e .
 cd ..
 ```
 
-### 1.4. Unpack the NeurIPS submission
+### 1.4. Change executable permissions for shell scripts
 ```bash
-unzip submission.zip
-cd cdrge_experiments      # all project scripts live here
-chmod +x *.sh      # ensure helper scripts are executable
+chmod +x ./scripts/*.sh      # ensure helper scripts are executable
 ```
 
 ---
