@@ -51,10 +51,12 @@ chmod +x ./scripts/*.sh      # ensure helper scripts are executable
 To ensure everything is working, lets train an 100m parameter LSTM across 8 GPUs to verify NCCL and Torch-distributed are working properly:
 
 ```bash
-# Port 29500 is the PyTorch default; change if it is already in use.
-python -m torch.distributed.launch --nproc_per_node=8 distributed_rge.py
-# or, explicitly:
-python -m torch.distributed.launch --nproc_per_node=8 --master_port=29501 distributed_rge.py
+# This will train a 7B param LSTM in 6-7 steps on a single batch
+python -m torch.distributed.launch --nproc_per_node=8 distributed_rge.py --tokenizer hf --model_type LSTM
+# or, explicitly on a port:
+python -m torch.distributed.launch --nproc_per_node=8 --master_port=29501 distributed_rge.py --tokenizer hf --model_type LSTM
+# or, if you want to train on openwebtext:
+python -m torch.distributed.launch --nproc_per_node=8 --master_port=29501 distributed_rge.py --tokenizer hf --model_type LSTM --mode train
 ```
 
 **If it hangs on systems *without* InfiniBand:**
@@ -63,26 +65,43 @@ export NCCL_P2P_DISABLE=1   # disables peer-to-peer paths
 # then re-run the smoke test
 ```
 
-The first run will require download of OWT from HF. Then you should expect to see:
+The first run will require download of OWT from HF. Then you should expect to see something like:
 ### Expected Smoke-Test Output
 ```text
 ==================================================
-[Train] Iteration 0, train_loss = 7.537032127380371, loss_ema_fast = 7.537032127380371, loss_ema_slow = 7.537032127380371, lr = 0.01, val_loss = 10000.0, current_max_seq_len = 10 time per step (TOTAL) = 0:00:17.729556
+[Train] Iteration 0, train_loss = 15.952009201049805, loss_ema_fast = 15.952009201049805, 
+loss_ema_slow = 15.952009201049805, lr = 0.01, val_loss = 10000.0, current_max_seq_len = 1
+0 time per step (TOTAL) = 0:00:32.612719
 ==================================================
-[Train] Iteration 1, train_loss = 3.640536069869995, loss_ema_fast = 7.537032127380371, loss_ema_slow = 7.537032127380371, lr = 0.01, val_loss = 10000.0, current_max_seq_len = 10 time per step (TOTAL) = 0:00:00.443671
+[Train] Iteration 1, train_loss = 11.7298002243042, loss_ema_fast = 15.952009201049805, lo
+ss_ema_slow = 15.952009201049805, lr = 0.01, val_loss = 10000.0, current_max_seq_len = 10 
+time per step (TOTAL) = 0:00:19.580045
 ==================================================
-[Train] Iteration 2, train_loss = 1.754884958267212, loss_ema_fast = 7.537032127380371, loss_ema_slow = 7.537032127380371, lr = 0.01, val_loss = 10000.0, current_max_seq_len = 10 time per step (TOTAL) = 0:00:00.440503
+[Train] Iteration 2, train_loss = 7.144695281982422, loss_ema_fast = 15.952009201049805, l
+oss_ema_slow = 15.952009201049805, lr = 0.01, val_loss = 10000.0, current_max_seq_len = 10
+ time per step (TOTAL) = 0:00:19.616047
 ==================================================
-[Train] Iteration 3, train_loss = 0.3342941999435425, loss_ema_fast = 7.537032127380371, loss_ema_slow = 7.537032127380371, lr = 0.01, val_loss = 10000.0, current_max_seq_len = 10 time per step (TOTAL) = 0:00:00.439098
+[Train] Iteration 3, train_loss = 3.346860408782959, loss_ema_fast = 15.952009201049805, l
+oss_ema_slow = 15.952009201049805, lr = 0.01, val_loss = 10000.0, current_max_seq_len = 10
+ time per step (TOTAL) = 0:00:19.678251
 ==================================================
-[Train] Iteration 4, train_loss = 0.09542964398860931, loss_ema_fast = 7.537032127380371, loss_ema_slow = 7.537032127380371, lr = 0.01, val_loss = 10000.0, current_max_seq_len = 10 time per step (TOTAL) = 0:00:00.438517
+[Train] Iteration 4, train_loss = 1.3321837186813354, loss_ema_fast = 15.952009201049805, 
+loss_ema_slow = 15.952009201049805, lr = 0.01, val_loss = 10000.0, current_max_seq_len = 1
+0 time per step (TOTAL) = 0:00:19.500257
+==================================================
+[Train] Iteration 5, train_loss = 0.7564062476158142, loss_ema_fast = 15.952009201049805, 
+loss_ema_slow = 15.952009201049805, lr = 0.01, val_loss = 10000.0, current_max_seq_len = 1
+0 time per step (TOTAL) = 0:00:19.638274
+==================================================
+[Train] Iteration 6, train_loss = 0.0468856617808342, loss_ema_fast = 15.952009201049805, 
+loss_ema_slow = 15.952009201049805, lr = 0.01, val_loss = 10000.0, current_max_seq_len = 1
+0 time per step (TOTAL) = 0:00:19.643672
 ==================================================
 ==================================================
 ==================================================
-[Rank 0] 2025-05-22 18:26:12 - FINISHED TRAINING: in 4 iterations acheived 0.09542964398860931 loss in 0:00:00.438517 seconds per iter.
-[Init] Model has 112606100 parameters across 1 layers.
-==================================================
-==================================================
+[Rank 0] 2025-05-26 14:03:54 - FINISHED TRAINING: in 6 iterations acheived 0.0468856617808
+342 loss in 0:00:19.643672 seconds per iter.
+[Init] Model has 6914405668 parameters across 1 layers.
 ==================================================
 ```
 ---
@@ -184,7 +203,7 @@ python -m torch.distributed.launch --nproc_per_node=8 distributed_rge.py \
 ### 4.2. Table 1 — **Series** (single-GPU) benchmarks  
 All series time and VRAM results are produced by a unit-test harness:
 ```bash
-python rge_serial_experiments.py --unittest
+python rge_series_experiments.py --unittest
 ```
 
 This will run one at a time all model sizes and optimizers (BPTT and CDRGE). Please observe the times per step and you can measure the actual VRAM used via nvidia-smi when prompted with "DONE! Now go get the actual vram"
@@ -231,7 +250,7 @@ GB iter_time=0.48s, total_time=0.07m, context_len=100, max_num=15, gen_eff_token
 - Optimal LR for SGD ≈ *(CD-RGE LR) / 10–100*.
 
 *Notes*
-The code for all of these runs is in rge_serial_experiments.py where we compare many zero order methods (far beyond what is reported in the paper). For all run configs, you should run an lr sweep from 1e-5 to 0.1. The smaller the model the more perturbations, the bigger your lr should be to get the same results as us, and visa versa. Typically, sgd's optimal lr is 10x or 100x smaller than the CDRGE code. For example, to train with sgd on model_scale 8, you need to set lr = 0.0001. To train with CDRGE 512 on model_scale 8, you need to set lr = 0.01. Note, all Figure 1 results were all run with the in series code as the distributed code was developed after the fact but gives similar results. There may be discrepency at later stages due to fp16 vs. fp32, so just increase the precision if you see discrepencies with n_pert > 96. 
+The code for all of these runs is in rge_series_experiments.py where we compare many zero order methods (far beyond what is reported in the paper). For all run configs, you should run an lr sweep from 1e-5 to 0.1. The smaller the model the more perturbations, the bigger your lr should be to get the same results as us, and visa versa. Typically, sgd's optimal lr is 10x or 100x smaller than the CDRGE code. For example, to train with sgd on model_scale 8, you need to set lr = 0.0001. To train with CDRGE 512 on model_scale 8, you need to set lr = 0.01. Note, all Figure 1 results were all run with the in series code as the distributed code was developed after the fact but gives similar results. There may be discrepency at later stages due to fp16 vs. fp32, so just increase the precision if you see discrepencies with n_pert > 96. 
 
 ### 4.4. Table 2 — LSTM (FlashRNN) training sweeps
 ```bash

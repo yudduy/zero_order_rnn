@@ -16,7 +16,7 @@ RUN_PREFIX="overfit_dnc"
 
 
 # Define hyperparameter arrays (adjust these values as needed):
-TASKS=("owt")
+TASKS=("copy")
 ARCHITECTURES=("dnc")
 
 
@@ -177,7 +177,8 @@ for TASK in "${TASKS[@]}"; do
                                                       screen -dmS "$RUN_NAME" bash -c "
                                                         echo '[INFO] Starting run: $RUN_NAME';
                                                         export WANDB_RUN_NAME=$RUN_NAME;
-                                                        python dnc_experiments.py \
+                                                        python rge_series_experiments.py \
+                                                          --model_type DNC
                                                           --device ${device_string} \
                                                           --task ${TASK} \
                                                           --arch ${ARCH} \
