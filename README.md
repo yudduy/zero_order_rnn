@@ -1,6 +1,6 @@
 # Official Repo For "Scaling Recurrent Neural Networks to a Billion Parameters with Zero-Order Optimization"
 
-This README explains how to train DNCs and LSTMs at billions of parameters on very inexpensive, small GPUs with Zero-Order Optimization. We offer all code to reproduce our results reported in our paper <https://arxiv.org/abs/1706.03762>.  
+This README explains how to train DNCs and LSTMs at billions of parameters on very inexpensive, small GPUs with Zero-Order Optimization. We offer all code to reproduce our results reported in our paper <http://arxiv.org/abs/2505.17852>.  
 
 All experiments were run on **A40 GPUs** (46 GB) obtained from [RunPod](https://www.runpod.io/) (up to 10 × A40 per node, ≈ \$4 / hr).  
 
