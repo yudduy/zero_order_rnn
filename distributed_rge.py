@@ -583,35 +583,37 @@ def save_distributed_checkpoint(optimizer, run_name, save_dir, rank):
 
 
 # ------------------------------------------------------------
-# load_distributed_checkpoint  (model only)
+# load_distributed_checkpoint 
 # ------------------------------------------------------------
-def load_distributed_checkpoint(optimizer, run_name, save_dir, device, rank):
+def load_distributed_checkpoint(optimizer, ckpt_path, device, rank):
     """
-    Rank-1: read <run_name>_model.pt  and load into the local model
-    All other ranks: return True (nothing to do)
+    Load a checkpoint directly from a full path.
+    Only rank 0 reads from disk and loads the model state.
     """
     if rank != 0:
-        return True
+        return True  # other ranks do nothing
 
-    ckpt_path = os.path.join(save_dir, f"{run_name}_model.pt")
+    if ckpt_path is None:
+        print(f"[rank{rank}] No checkpoint provided. Starting from scratch.")
+        return False
+
     if not os.path.exists(ckpt_path):
-        print(f"[rank{rank}] WARNING – checkpoint {ckpt_path} not found")
+        print(f"[rank{rank}] WARNING – checkpoint {ckpt_path} not found. Starting from scratch.")
         return False
 
     ckpt = torch.load(ckpt_path, map_location=device)
     optimizer.model.load_state_dict(ckpt["model_state_dict"])
 
-    # optional sanity-check of architecture fields
-    loaded_args  = ckpt.get("model_args", {})
+    # Sanity check architecture
+    loaded_args = ckpt.get("model_args", {})
     current_args = {k: getattr(optimizer.model, k)
-                    for k in loaded_args.keys()}          # same subset
+                    for k in loaded_args.keys()}
 
     for k, v in loaded_args.items():
         if current_args.get(k) != v:
-            print(f"[rank{rank}] WARNING – mismatch {k}: "
-                  f"ckpt={v}, current={current_args.get(k)}")
+            print(f"[rank{rank}] WARNING – mismatch {k}: ckpt={v}, current={current_args.get(k)}")
 
-    print(f"[rank{rank}] checkpoint {ckpt_path} restored")
+    print(f"[rank{rank}] Loaded checkpoint from {ckpt_path}")
     return True
 
 
@@ -622,87 +624,39 @@ def main():
     import os
     os.environ["WANDB_API_KEY"] = ""
 
-    # parser = argparse.ArgumentParser()
-    # parser.add_argument("--local-rank", type=int, default=-1, help="Local rank for distributed training.")
-    # parser.add_argument("--mode", type=str, choices=["test", "train"], default="train", help="Run mode: test or train.")
-    # parser.add_argument("--max_iters", type=int, default=1e10, help="Maximum iterations for training.")
-    # parser.add_argument("--learning_rate", type=float, default=0.001, help="Base learning rate (and eps, tied 1:1).")
-    # parser.add_argument("--weight_decay", type=float, default=0.00001, help="Standard weight decay.")
-    # parser.add_argument("--beta1", type=float, default=0.99, help="Base learning rate (and eps, tied 1:1).")
-    # parser.add_argument("--beta2", type=float, default=0.999, help="Base learning rate (and eps, tied 1:1).")
-    # parser.add_argument("--epsilon_tying_ratio", type=float, default=1.0, help="Perturbation scale epsilon (tied to learning rate).")
-    # parser.add_argument("--probe_dropout_rate", type=float, default=0., help="Dropout rate for probe vector.")
-    # parser.add_argument("--wandb_proj", type=str, default=None, help="WandB project name (optional)")
-    # parser.add_argument("--wandb_run", type=str, default=None, help="WandB run name (optional)")
-    # parser.add_argument("--warmup_iters", type=int, default=100, help="Warmup iterations.")
-    # parser.add_argument("--cosine_wavelength", type=int, default=1000, help="Cosine LR wavelength, init to very high.")
-    # parser.add_argument("--val_iters", type=int, default=10, help="Val iters, when we run val and log to wandb, and potentially checkpoint.")
-    # parser.add_argument("--meta_perturbations", type=int, default=12, help="Number of Perturbations for all ranks per step.")
-    # parser.add_argument("--scatter_batch", type=str, choices=["true", "false"], default="false", help="whether each perturbation should be on a different batch, if true, we sample (world_size-2)*batch_size x_ids and y per iter and scatter it to the appropriate ranks.")
-    
-    # # New CLI arguments for model configuration
-    # parser.add_argument("--model_scale", type=int, default=1, help="Scaling factor for model dimensions.")
-    # parser.add_argument("--num_heads", type=int, default=16, help="# dnc heads.")
-    # parser.add_argument("--memory_size", type=int, default=128, help="memory_size.")
-    # parser.add_argument("--hidden_size", type=int, default=128, help="hidden_size.")
-    # parser.add_argument("--input_size", type=int, default=128, help="Input size.")
-    # parser.add_argument("--head_size", type=int, default=128, help="head_size .")
-    
-    # parser.add_argument("--batch_size", type=int, default=512, help="Batch size. BE SURE TO REDUCE LR AS YOU INCREASE BATCH SIZE BY SQRT(BATCHSIZE) as stability increases the exp delta loss decreases. So needs lower LR.")
-    # parser.add_argument("--min_seq_len", type=int, default=4, help="Min sequence length.")
-    # parser.add_argument("--max_seq_len", type=int, default=100000, help="Max sequence length.")
-    # parser.add_argument("--step_seq_len", type=int, default=2, help="How much to step the sequence length.")
-    # parser.add_argument("--step_seq_len_loss_thresh", type=float, default=3.0, help="At what threshold to check the loss to step sequence length.")
-    # parser.add_argument("--patience_seq_len", type=int, default=50, help="How patient to be before stepping sequence length.")
-    # parser.add_argument("--tokenizer", type=str, default="hf", choices=["hf", None], 
-    #                 help="Tokenizer to use. If 'hf', will use HuggingFace tokenizer. If None, will use character tokenizer.")
-    # parser.add_argument("--probe_normalization", type=str, choices=["true", "false"], default="false", help="normalizes the probe before applying to the model before query. helps limit the magnitude of the probe to the epsilon-hypersphere.")
-    # parser.add_argument("--gradient_normalization", type=str, choices=["true", "false"], default="false", help="normalizes the final gradient before updating the model weights.")
-    # parser.add_argument("--adaptive", type=str, choices=["true", "false"], default="false", help="if true biases the sampling by the adam_ratio, otherwise 0 mean sampling.")
-    # parser.add_argument("--adam", type=str, choices=["true", "false"], default="false", help="if true use adam, else use vanilla sgd.")
-    # parser.add_argument("--use_different_batch_per_meta_perturbation", type=str, choices=["true", "false"], default="false", help="if true use a different minibatch per meta_perturbation, else use all the same.")
-    # parser.add_argument("--normal_distribution", type=str, choices=["true", "false"], default="false", help="if true use normal distribution, otherwise use rademacher +/- 1.")
-    # parser.add_argument("--l1_norm", type=str, choices=["true", "false"], default="false", help="if true use L1 norm, else use L2 norm for grad normalization and for probe normalization (may help stablize for very large models).")
-    # parser.add_argument("--antithetic", type=str, choices=["true", "false"], default="true", help="if true use antithetic sampling for forward diff (not for central as its redundant), else dont.. it will double convergence rate!")
-    # parser.add_argument("--central_difference", type=str, choices=["true", "false"], default="true", help="if true use central difference, else use forward diff.")
-    # parser.add_argument("--learn_rate_schedule", type=str, choices=["true", "false"], default="true", help="if we want a lr schedule.")
-    # parser.add_argument("--model_type", type=str, choices=["DNC", "LSTM"], default="LSTM", help="Type of model to use.")
-    # parser.add_argument("--verbose", type=str, choices=["true", "false"], default="false", help="verbosity settings.")
-    # args = parser.parse_args()
-    
-    
-    # # TEST OVERFIT FAST DEMO! 
     parser = argparse.ArgumentParser()
     parser.add_argument("--local-rank", type=int, default=-1, help="Local rank for distributed training.")
-    parser.add_argument("--mode", type=str, choices=["test", "train"], default="test", help="Run mode: test or train.")
+    parser.add_argument("--mode", type=str, choices=["test", "train"], default="train", help="Run mode: test or train.")
     parser.add_argument("--max_iters", type=int, default=1e10, help="Maximum iterations for training.")
-    parser.add_argument("--learning_rate", type=float, default=0.01, help="Base learning rate (and eps, tied 1:1).")
-    parser.add_argument("--beta1", type=float, default=0.0, help="Base learning rate (and eps, tied 1:1).")
-    parser.add_argument("--beta2", type=float, default=0.0, help="Base learning rate (and eps, tied 1:1).")
+    parser.add_argument("--learning_rate", type=float, default=0.001, help="Base learning rate (and eps, tied 1:1).")
+    parser.add_argument("--weight_decay", type=float, default=0.00001, help="Standard weight decay.")
+    parser.add_argument("--beta1", type=float, default=0.99, help="Base learning rate (and eps, tied 1:1).")
+    parser.add_argument("--beta2", type=float, default=0.999, help="Base learning rate (and eps, tied 1:1).")
     parser.add_argument("--epsilon_tying_ratio", type=float, default=1.0, help="Perturbation scale epsilon (tied to learning rate).")
-    parser.add_argument("--weight_decay", type=float, default=0.0, help="Standard weight decay.")
     parser.add_argument("--probe_dropout_rate", type=float, default=0., help="Dropout rate for probe vector.")
     parser.add_argument("--wandb_proj", type=str, default=None, help="WandB project name (optional)")
     parser.add_argument("--wandb_run", type=str, default=None, help="WandB run name (optional)")
-    parser.add_argument("--warmup_iters", type=int, default=0, help="Warmup iterations.")
-    parser.add_argument("--cosine_wavelength", type=int, default=100000000, help="Cosine LR wavelength, init to very high.")
+    parser.add_argument("--warmup_iters", type=int, default=100, help="Warmup iterations.")
+    parser.add_argument("--cosine_wavelength", type=int, default=1000, help="Cosine LR wavelength, init to very high.")
     parser.add_argument("--val_iters", type=int, default=10, help="Val iters, when we run val and log to wandb, and potentially checkpoint.")
     parser.add_argument("--meta_perturbations", type=int, default=12, help="Number of Perturbations for all ranks per step.")
     parser.add_argument("--scatter_batch", type=str, choices=["true", "false"], default="false", help="whether each perturbation should be on a different batch, if true, we sample (world_size-2)*batch_size x_ids and y per iter and scatter it to the appropriate ranks.")
+    
+    # New CLI arguments for model configuration
     parser.add_argument("--model_scale", type=int, default=1, help="Scaling factor for model dimensions.")
-    parser.add_argument("--num_heads", type=int, default=2**8, help="# dnc heads.")
+    parser.add_argument("--num_heads", type=int, default=16, help="# dnc heads.")
     parser.add_argument("--memory_size", type=int, default=128, help="memory_size.")
-    parser.add_argument("--hidden_size", type=int, default=2**17, help="hidden_size.")
-    parser.add_argument("--input_size", type=int, default=100, help="Input size.")
-    parser.add_argument("--head_size", type=int, default=0, help="head_size .")
-    parser.add_argument("--batch_size", type=int, default=1, help="Batch size. BE SURE TO REDUCE LR AS YOU INCREASE BATCH SIZE BY SQRT(BATCHSIZE) as stability increases the exp delta loss decreases. So needs lower LR.")
-    parser.add_argument("--min_seq_len", type=int, default=10, help="Min sequence length.")
-    parser.add_argument("--max_seq_len", type=int, default=10, help="Max sequence length.")
-    parser.add_argument("--step_seq_len", type=int, default=10, help="How much to step the sequence length.")
-    parser.add_argument("--step_seq_len_loss_thresh", type=float, default=0.0, help="At what threshold to check the loss to step sequence length.")
-    parser.add_argument("--model_type", type=str, choices=["DNC", "LSTM"], default="LSTM", help="Type of model to use.")
-    parser.add_argument("--patience_seq_len", type=int, default=100, help="How patient to be before stepping sequence length.")    
-    parser.add_argument("--tokenizer", type=str, default=None, choices=["hf", None], 
+    parser.add_argument("--hidden_size", type=int, default=128, help="hidden_size.")
+    parser.add_argument("--input_size", type=int, default=128, help="Input size.")
+    parser.add_argument("--head_size", type=int, default=128, help="head_size .")
+    
+    parser.add_argument("--batch_size", type=int, default=512, help="Batch size. BE SURE TO REDUCE LR AS YOU INCREASE BATCH SIZE BY SQRT(BATCHSIZE) as stability increases the exp delta loss decreases. So needs lower LR.")
+    parser.add_argument("--min_seq_len", type=int, default=4, help="Min sequence length.")
+    parser.add_argument("--max_seq_len", type=int, default=100000, help="Max sequence length.")
+    parser.add_argument("--step_seq_len", type=int, default=2, help="How much to step the sequence length.")
+    parser.add_argument("--step_seq_len_loss_thresh", type=float, default=3.0, help="At what threshold to check the loss to step sequence length.")
+    parser.add_argument("--patience_seq_len", type=int, default=50, help="How patient to be before stepping sequence length.")
+    parser.add_argument("--tokenizer", type=str, default="hf", choices=["hf", None], 
                     help="Tokenizer to use. If 'hf', will use HuggingFace tokenizer. If None, will use character tokenizer.")
     parser.add_argument("--probe_normalization", type=str, choices=["true", "false"], default="false", help="normalizes the probe before applying to the model before query. helps limit the magnitude of the probe to the epsilon-hypersphere.")
     parser.add_argument("--gradient_normalization", type=str, choices=["true", "false"], default="false", help="normalizes the final gradient before updating the model weights.")
@@ -711,10 +665,63 @@ def main():
     parser.add_argument("--use_different_batch_per_meta_perturbation", type=str, choices=["true", "false"], default="false", help="if true use a different minibatch per meta_perturbation, else use all the same.")
     parser.add_argument("--normal_distribution", type=str, choices=["true", "false"], default="false", help="if true use normal distribution, otherwise use rademacher +/- 1.")
     parser.add_argument("--l1_norm", type=str, choices=["true", "false"], default="false", help="if true use L1 norm, else use L2 norm for grad normalization and for probe normalization (may help stablize for very large models).")
-    parser.add_argument("--antithetic", type=str, choices=["true", "false"], default="false", help="if true use antithetic sampling, else dont.. it will double convergence rate!")
+    parser.add_argument("--antithetic", type=str, choices=["true", "false"], default="true", help="if true use antithetic sampling for forward diff (not for central as its redundant), else dont.. it will double convergence rate!")
     parser.add_argument("--central_difference", type=str, choices=["true", "false"], default="true", help="if true use central difference, else use forward diff.")
-    parser.add_argument("--learn_rate_schedule", type=str, choices=["true", "false"], default="false", help="if we want a lr schedule.")
+    parser.add_argument("--learn_rate_schedule", type=str, choices=["true", "false"], default="true", help="if we want a lr schedule.")
+    parser.add_argument("--model_type", type=str, choices=["DNC", "LSTM"], default="LSTM", help="Type of model to use.")
+    parser.add_argument("--load_from_checkpoint", type=str, default=None,
+                    help="Path to a .pt model checkpoint to load before training.")
     parser.add_argument("--verbose", type=str, choices=["true", "false"], default="false", help="verbosity settings.")
+    args = parser.parse_args()
+    
+    
+    # # TEST OVERFIT FAST DEMO! 
+    # parser = argparse.ArgumentParser()
+    # parser.add_argument("--local-rank", type=int, default=-1, help="Local rank for distributed training.")
+    # parser.add_argument("--mode", type=str, choices=["test", "train"], default="test", help="Run mode: test or train.")
+    # parser.add_argument("--max_iters", type=int, default=1e10, help="Maximum iterations for training.")
+    # parser.add_argument("--learning_rate", type=float, default=0.01, help="Base learning rate (and eps, tied 1:1).")
+    # parser.add_argument("--beta1", type=float, default=0.0, help="Base learning rate (and eps, tied 1:1).")
+    # parser.add_argument("--beta2", type=float, default=0.0, help="Base learning rate (and eps, tied 1:1).")
+    # parser.add_argument("--epsilon_tying_ratio", type=float, default=1.0, help="Perturbation scale epsilon (tied to learning rate).")
+    # parser.add_argument("--weight_decay", type=float, default=0.0, help="Standard weight decay.")
+    # parser.add_argument("--probe_dropout_rate", type=float, default=0., help="Dropout rate for probe vector.")
+    # parser.add_argument("--wandb_proj", type=str, default=None, help="WandB project name (optional)")
+    # parser.add_argument("--wandb_run", type=str, default=None, help="WandB run name (optional)")
+    # parser.add_argument("--warmup_iters", type=int, default=0, help="Warmup iterations.")
+    # parser.add_argument("--cosine_wavelength", type=int, default=100000000, help="Cosine LR wavelength, init to very high.")
+    # parser.add_argument("--val_iters", type=int, default=10, help="Val iters, when we run val and log to wandb, and potentially checkpoint.")
+    # parser.add_argument("--meta_perturbations", type=int, default=12, help="Number of Perturbations for all ranks per step.")
+    # parser.add_argument("--scatter_batch", type=str, choices=["true", "false"], default="false", help="whether each perturbation should be on a different batch, if true, we sample (world_size-2)*batch_size x_ids and y per iter and scatter it to the appropriate ranks.")
+    # parser.add_argument("--model_scale", type=int, default=1, help="Scaling factor for model dimensions.")
+    # parser.add_argument("--num_heads", type=int, default=2**8, help="# dnc heads.")
+    # parser.add_argument("--memory_size", type=int, default=128, help="memory_size.")
+    # parser.add_argument("--hidden_size", type=int, default=2**17, help="hidden_size.")
+    # parser.add_argument("--input_size", type=int, default=100, help="Input size.")
+    # parser.add_argument("--head_size", type=int, default=0, help="head_size .")
+    # parser.add_argument("--batch_size", type=int, default=1, help="Batch size. BE SURE TO REDUCE LR AS YOU INCREASE BATCH SIZE BY SQRT(BATCHSIZE) as stability increases the exp delta loss decreases. So needs lower LR.")
+    # parser.add_argument("--min_seq_len", type=int, default=10, help="Min sequence length.")
+    # parser.add_argument("--max_seq_len", type=int, default=10, help="Max sequence length.")
+    # parser.add_argument("--step_seq_len", type=int, default=10, help="How much to step the sequence length.")
+    # parser.add_argument("--step_seq_len_loss_thresh", type=float, default=0.0, help="At what threshold to check the loss to step sequence length.")
+    # parser.add_argument("--patience_seq_len", type=int, default=100, help="How patient to be before stepping sequence length.")    
+    # parser.add_argument("--tokenizer", type=str, default=None, choices=["hf", None], 
+    #                 help="Tokenizer to use. If 'hf', will use HuggingFace tokenizer. If None, will use character tokenizer.")
+    # parser.add_argument("--probe_normalization", type=str, choices=["true", "false"], default="false", help="normalizes the probe before applying to the model before query. helps limit the magnitude of the probe to the epsilon-hypersphere.")
+    # parser.add_argument("--gradient_normalization", type=str, choices=["true", "false"], default="false", help="normalizes the final gradient before updating the model weights.")
+    # parser.add_argument("--adaptive", type=str, choices=["true", "false"], default="false", help="if true biases the sampling by the adam_ratio, otherwise 0 mean sampling.")
+    # parser.add_argument("--adam", type=str, choices=["true", "false"], default="false", help="if true use adam, else use vanilla sgd.")
+    # parser.add_argument("--use_different_batch_per_meta_perturbation", type=str, choices=["true", "false"], default="false", help="if true use a different minibatch per meta_perturbation, else use all the same.")
+    # parser.add_argument("--normal_distribution", type=str, choices=["true", "false"], default="false", help="if true use normal distribution, otherwise use rademacher +/- 1.")
+    # parser.add_argument("--l1_norm", type=str, choices=["true", "false"], default="false", help="if true use L1 norm, else use L2 norm for grad normalization and for probe normalization (may help stablize for very large models).")
+    # parser.add_argument("--antithetic", type=str, choices=["true", "false"], default="false", help="if true use antithetic sampling, else dont.. it will double convergence rate!")
+    # parser.add_argument("--central_difference", type=str, choices=["true", "false"], default="true", help="if true use central difference, else use forward diff.")
+    # parser.add_argument("--learn_rate_schedule", type=str, choices=["true", "false"], default="false", help="if we want a lr schedule.")
+     # parser.add_argument("--model_type", type=str, choices=["DNC", "LSTM"], default="LSTM", help="Type of model to use.")
+    # parser.add_argument("--load_from_checkpoint", type=str, default=None,
+    #                 help="Path to a .pt model checkpoint to load before training.")
+
+    # parser.add_argument("--verbose", type=str, choices=["true", "false"], default="false", help="verbosity settings.")
 
     
     args = parser.parse_args()
@@ -728,7 +735,7 @@ def main():
     args.learn_rate_schedule = True if args.learn_rate_schedule == "true" else False 
 
     verbose = True if args.verbose == "true" else False     
-    
+
     #####################################################################################
     # SETUP TRAINING
     #####################################################################################
@@ -801,10 +808,8 @@ def main():
     opt_params = f"_coswav_{args.cosine_wavelength}_wu{args.warmup_iters}_mp{args.meta_perturbations}"
     
     # Combine all parts
-    if args.wandb_run=="":
+    if args.wandb_run=="" or args.wandb_run is None:
          args.wandb_run = run_name + model_params + train_params + opt_params
-    
-
     
     
     log_msg("Trying first dist.barrier(), if hanging here, no infiniband likely on node, need to turn off p2p",rank,"if so, run export NCCL_P2P_DISABLE=1")
@@ -813,32 +818,32 @@ def main():
 
     log_start("INIT MODEL", rank)
 
-    with torch.inference_mode():
-        if args.model_type == "LSTM":
-            embed = nn.Embedding(args.vocab_size, args.input_size, device=device)
-            model = LSTM(
-                input_size  = args.input_size,
-                output_size = args.vocab_size,
-                hidden_size = args.hidden_size,
-                memory_size = args.memory_size,
-                head_size   = args.head_size,
-                num_heads   = args.num_heads,
-                embed       = embed,
-                device      = device,
-            )
-        elif args.model_type == "DNC":
-            torch.backends.cudnn.enabled = False
-            # time.sleep(rank) # we stagger the launch of DNC formation prevent RAM issues
-            embed = nn.Embedding(args.vocab_size, args.input_size,device=device)
-            model = DNC(input_size=args.input_size, output_size=args.vocab_size, hidden_size=args.hidden_size, memory_size=args.memory_size, head_size=args.head_size, num_heads=args.num_heads, embed=embed, device=device)
-            # model.controller.flatten_parameters()
-            model.eval()
-        else:
-            raise Exception(f"Unk model type: {args.model_type}")
+    # with torch.inference_mode():
+    if args.model_type == "LSTM":
+        embed = nn.Embedding(args.vocab_size, args.input_size, device=device)
+        model = LSTM(
+            input_size  = args.input_size,
+            output_size = args.vocab_size,
+            hidden_size = args.hidden_size,
+            memory_size = args.memory_size,
+            head_size   = args.head_size,
+            num_heads   = args.num_heads,
+            embed       = embed,
+            device      = device,
+        )
+    elif args.model_type == "DNC":
+        torch.backends.cudnn.enabled = False
+        # time.sleep(rank) # we stagger the launch of DNC formation prevent RAM issues
+        embed = nn.Embedding(args.vocab_size, args.input_size,device=device)
+        model = DNC(input_size=args.input_size, output_size=args.vocab_size, hidden_size=args.hidden_size, memory_size=args.memory_size, head_size=args.head_size, num_heads=args.num_heads, embed=embed, device=device)
+        # model.controller.flatten_parameters()
+        
+    else:
+        raise Exception(f"Unk model type: {args.model_type}")
     
     
     
-    distributed_adaptive = RGEOptimizerDistributed(
+    distributed_optimizer = RGEOptimizerDistributed(
         model=model,
         learning_rate=args.learning_rate,
         probe_dropout_rate=args.probe_dropout_rate,
@@ -857,8 +862,22 @@ def main():
         l1_norm = args.l1_norm=="true",
         verbose=verbose
     )
-    dist.barrier()
     
+    dist.barrier()
+
+    if rank == 0:
+        # load checkpoint on rank 0, and will get broadcasted to the rest
+        if args.load_from_checkpoint is not None:
+            loaded = load_distributed_checkpoint(distributed_optimizer, args.load_from_checkpoint, device, rank)
+            if loaded:
+                print(f"[rank{rank}] ✅ Checkpoint loaded successfully. Continuing training.")
+            else:
+                print(f"[rank{rank}] ⚠️ Failed to load checkpoint. Training from scratch.")
+        else:
+            print(f"[rank{rank}] No checkpoint specified. Training from raw weights.")
+        
+
+    model.eval()
     
     # if rank != 0:
 
@@ -900,7 +919,7 @@ def main():
     
 
     
-    if rank == distributed_adaptive.clean_rank:
+    if rank == distributed_optimizer.clean_rank:
         # Loss EMA tracking - one fast, one slow
         loss_ema_fast = None
         loss_ema_slow = None
@@ -920,7 +939,7 @@ def main():
         prev_loss = float('inf')
         
     
-    if rank == distributed_adaptive.clean_rank and args.wandb_proj is not None and wandb is not None:
+    if rank == distributed_optimizer.clean_rank and args.wandb_proj is not None and wandb is not None:
         # wandb.init(project=args.wandb_proj, name=args.wandb_run)
         wandb.init(project=args.wandb_proj,name=args.wandb_run)
         wandb.config.update( vars(args) )
@@ -1022,26 +1041,26 @@ def main():
             #####################################################################################
             # TRAIN THE MODEL
             #####################################################################################
-            # if distributed_adaptive.adam:
+            # if distributed_optimizer.adam:
             
             if args.central_difference:
                 # central_difference_distributed
-                train_loss = distributed_adaptive.dist_cdrge_step(x_ids, y, criterion, iteration=i)
+                train_loss = distributed_optimizer.dist_cdrge_step(x_ids, y, criterion, iteration=i)
             else:
-                train_loss = distributed_adaptive.forward_difference_distributed(x_ids, y, criterion, iteration=i)
+                train_loss = distributed_optimizer.forward_difference_distributed(x_ids, y, criterion, iteration=i)
 
             
             # else: # todo, need to implement this to be more efficient with GPUs
-            #     train_loss = distributed_adaptive.distributed_step_SPSA(x_ids, y, criterion, iteration=i)
+            #     train_loss = distributed_optimizer.distributed_step_SPSA(x_ids, y, criterion, iteration=i)
 
             
 
             #####################################################################################
             # CHECKPOINT THE MODEL RARELY
             #####################################################################################
-            if args.mode == "train" and (i+1) % (args.val_iters*100) == 0:
+            if args.mode == "train" and (i+1) % (args.val_iters) == 0:
                 
-                save_distributed_checkpoint(distributed_adaptive, 
+                save_distributed_checkpoint(distributed_optimizer, 
                                             args.wandb_run, 
                                             "rnn_checkpoints", 
                                             rank)
@@ -1049,7 +1068,7 @@ def main():
             
                 
             
-            if rank == distributed_adaptive.clean_rank:
+            if rank == distributed_optimizer.clean_rank:
                 #####################################################################################
                 # UPDATE THE LEARNING RATE WITH OUR FAST/SLOW EMA COSINE LR SCHEDULE
                 #####################################################################################
@@ -1065,8 +1084,8 @@ def main():
                 if args.learn_rate_schedule:
                     if i < args.warmup_iters:
                         # Linear warmup
-                        distributed_adaptive.learning_rate = base_lr * (i / args.warmup_iters)
-                        distributed_adaptive.learning_rate = max(1e-8,distributed_adaptive.learning_rate)
+                        distributed_optimizer.learning_rate = base_lr * (i / args.warmup_iters)
+                        distributed_optimizer.learning_rate = max(1e-8,distributed_optimizer.learning_rate)
                     else:
                         
                         # Check if the fast EMA is higher than the slow EMA (by a small threshold)
@@ -1088,7 +1107,7 @@ def main():
                         
                         progress = i / cosine_wavelength
                         cosine_factor = 0.5 * (1 + math.cos(math.pi * progress))
-                        distributed_adaptive.learning_rate = min_lr + (base_lr - min_lr) * cosine_factor
+                        distributed_optimizer.learning_rate = min_lr + (base_lr - min_lr) * cosine_factor
     
     
                     #####################################################################################
@@ -1114,7 +1133,7 @@ def main():
                 #####################################################################################
                 # RUN VALIDATION
                 #####################################################################################
-                if rank == distributed_adaptive.clean_rank and (i+1) % args.val_iters == 0:
+                if rank == distributed_optimizer.clean_rank and (i+1) % args.val_iters == 0:
 
                     if args.mode == "train":
         
@@ -1194,7 +1213,7 @@ def main():
                             "loss_ema_fast":loss_ema_fast,
                             "loss_ema_slow":loss_ema_slow,
                             "current_max_seq_len":current_max_seq_len,
-                            "lr": distributed_adaptive.learning_rate,
+                            "lr": distributed_optimizer.learning_rate,
                             "weight_decay_loss": weight_decay_loss.item(),
                         }
                         
@@ -1210,11 +1229,11 @@ def main():
                 print("="*50)
                 average_time_per_iter = (datetime.datetime.now() - start_time)
                 start_time = datetime.datetime.now()
-                print(f"[Train] Iteration {i }, train_loss = {train_loss}, loss_ema_fast = {loss_ema_fast}, loss_ema_slow = {loss_ema_slow}, lr = {distributed_adaptive.learning_rate}, val_loss = {val_loss}, current_max_seq_len = {current_max_seq_len} time per step (TOTAL) = { average_time_per_iter }")
+                print(f"[Train] Iteration {i }, train_loss = {train_loss}, loss_ema_fast = {loss_ema_fast}, loss_ema_slow = {loss_ema_slow}, lr = {distributed_optimizer.learning_rate}, val_loss = {val_loss}, current_max_seq_len = {current_max_seq_len} time per step (TOTAL) = { average_time_per_iter }")
                 
 
             dist.barrier()
-            if rank == distributed_adaptive.clean_rank:
+            if rank == distributed_optimizer.clean_rank:
                 if train_loss < 0.1:
 
                     end_time = datetime.datetime.now()
