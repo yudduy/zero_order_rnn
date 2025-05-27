@@ -19,7 +19,7 @@ All experiments were run on **A40 GPUs** (46 GB) obtained from [RunPod](https://
 ### 1.1. System packages
 ```bash
 sudo apt update -y
-sudo apt install -y screen vim micro nano unzip
+sudo apt install -y screen vim micro nano u100nzip
 ```
 
 ### 1.2. Python environment
@@ -48,15 +48,13 @@ chmod +x ./scripts/*.sh      # ensure helper scripts are executable
 
 ## 2. Smoke Test 🔥
 
-To ensure everything is working, lets train an 100m parameter LSTM across 8 GPUs to verify NCCL and Torch-distributed are working properly:
+To ensure everything is working, lets train an 7B parameter LSTM across 8 GPUs to verify NCCL and Torch-distributed are working properly:
 
 ```bash
 # This will train a 7B param LSTM in 6-7 steps on a single batch
 python -m torch.distributed.launch --nproc_per_node=8 distributed_rge.py --tokenizer hf --model_type LSTM
 # or, explicitly on a port:
 python -m torch.distributed.launch --nproc_per_node=8 --master_port=29501 distributed_rge.py --tokenizer hf --model_type LSTM
-# or, if you want to train on openwebtext:
-python -m torch.distributed.launch --nproc_per_node=8 --master_port=29501 distributed_rge.py --tokenizer hf --model_type LSTM --mode train
 ```
 
 **If it hangs on systems *without* InfiniBand:**
@@ -64,6 +62,7 @@ python -m torch.distributed.launch --nproc_per_node=8 --master_port=29501 distri
 export NCCL_P2P_DISABLE=1   # disables peer-to-peer paths
 # then re-run the smoke test
 ```
+
 
 The first run will require download of OWT from HF. Then you should expect to see something like:
 ### Expected Smoke-Test Output
@@ -104,6 +103,26 @@ loss_ema_slow = 15.952009201049805, lr = 0.01, val_loss = 10000.0, current_max_s
 [Init] Model has 6914405668 parameters across 1 layers.
 ==================================================
 ```
+
+```bash
+# For a real training, if you want to train on openwebtext, you can run this:
+python -m torch.distributed.launch --nproc_per_node=8 --master_port=29501 distributed_rge.py --tokenizer hf --model_type LSTM --mode train
+```
+
+```bash
+# to run sweeps over HPPs you can run:
+./scripts/run_dnc_experiments.sh
+# then you can check on all screen sessions like so:
+./scripts/capture_screen_logs.sh
+```
+
+```bash
+# to run one offs for HPPs you can run:
+./scripts/run_lstm_experiments.sh
+# then you can check on all screen sessions like so:
+./scripts/capture_screen_logs.sh
+```
+
 ---
 
 ## 3. Enabling Weights & Biases or Neptune (optional)

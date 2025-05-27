@@ -45,7 +45,7 @@ LARGE_LR=0.01
 # Base common parameters (will be overridden by model-specific params). If you want wandb:
 # BASE_PARAMS="--device cuda --macro_batch_size 1 --max_iterations 10000000 --distribution rad --wandb --wandb_proj LSTM_experiments"
 # if you dont want wandb
-BASE_PARAMS="--device cuda --macro_batch_size 1 --max_iterations 10000000 --distribution rad --no_wandb"
+BASE_PARAMS=" --macro_batch_size 1 --max_iterations 10000000 --distribution rad"
 
 # CDRGE@96 params (num_perturbations=96)
 CDRGE_96="--num_perturbations 96"

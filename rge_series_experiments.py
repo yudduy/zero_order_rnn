@@ -1084,7 +1084,27 @@ def evaluate(model, tok, args, split="val", show_predictions=True, num_samples=3
         accuracy = compute_task_accuracy(logits, batch_np, tok, args.task)
 
         if show_predictions and args.task in ["copy","repeat_copy","sort","reverse","add"]:
-            _show_preds(batch_np, logits, tok, args)  # ← your existing pretty-printer
+            preds = torch.argmax(logits, dim=-1)
+
+            if args.tokenizer == "hf_tiktoken":
+                decode_fn = lambda ids: tok.decode(ids.tolist())
+                decoded_preds = [decode_fn(seq) for seq in preds]
+                decoded_inputs = [decode_fn(seq) for seq in ids]
+                decoded_targets = [decode_fn(seq) for seq in torch.as_tensor(batch_np)]
+            else:
+                id_to_char = tok.id_to_char if hasattr(tok, "id_to_char") else tok.id_to_token
+                decode_fn = lambda ids: "".join([id_to_char.get(i.item(), '') for i in ids])
+                decoded_preds = [decode_fn(seq) for seq in preds]
+                decoded_inputs = [decode_fn(seq) for seq in ids]
+                decoded_targets = [decode_fn(seq) for seq in torch.as_tensor(batch_np)]
+
+            print("=" * 40)
+            print(f"Validation predictions ({split} split):")
+            for i in range(min(len(decoded_preds), num_samples)):
+                print(f"[Sample {i}] Input:     '{decoded_inputs[i]}'")
+                print(f"[Sample {i}] Target:    '{decoded_targets[i]}'")
+                print(f"[Sample {i}] Predicted: '{decoded_preds[i]}'")
+            print("=" * 40)
 
         return {"loss": loss, "accuracy": accuracy}
 
@@ -1810,14 +1830,13 @@ def get_argument_parser():
                         help="Use backpropagation through time instead of FDRAS or CDRGE")
     parser.add_argument("--use_adam", action="store_true", default=False,
                         help="Use Adam optimizer vs. vanilla SGD")
+    parser.add_argument("--overfit_to_one_batch_flag", action="store_true", default=False,
+                        help="Use the same batch for all training iterations")
 
     # Curriculum learning
     parser.add_argument("--curriculum", action="store_true")
     parser.add_argument("--curriculum_steps", type=int, default=5)
 
-    # Training options
-    parser.add_argument("--overfit_to_one_batch_flag", action="store_true",
-                        help="Use the same batch for all training iterations")
 
     # Experiment tracking
     parser.add_argument("--log_interval", type=int, default=10)
