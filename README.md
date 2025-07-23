@@ -19,7 +19,7 @@ All experiments were run on **A40 GPUs** (46 GB) obtained from [RunPod](https://
 ### 1.1. System packages
 ```bash
 sudo apt update -y
-sudo apt install -y screen vim micro nano u100nzip
+sudo apt install -y screen vim micro nano unzip
 ```
 
 ### 1.2. Python environment
