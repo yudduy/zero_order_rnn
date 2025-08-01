@@ -24,7 +24,7 @@ import torch.nn.functional as F
 
 from pathlib import Path
 from simpletokenizers.simpletokenizers import CharTokenizer, NumericTokenizer, get_tiktoken
-from models.models        import LSTM, DNC
+from models.models        import LSTM, DNC #Transformer, Mamba, SSM
 from tasks.tasks          import get_examples_for_task, compute_task_loss, compute_task_accuracy
 
 import pdb
@@ -694,7 +694,7 @@ def cdrge_optimize(model_params,
         model_params: List of model parameters to optimize
         loss_fn: Function that computes the loss
         lr: Learning rate
-        epsilon: Perturbation scale (same as lr for numerical stability)
+        epsilon: Perturbation scale (recomend to be same as lr for numerical stability)
         iterations: Number of optimization iterations
         num_perturbations: Number of random perturbations to use
         distribution: Type of distribution for perturbations ('rad', 'normal', 'uniform')
@@ -718,6 +718,9 @@ def cdrge_optimize(model_params,
         'grad_norm': []
     }
 
+
+    lr_to_eta_ratio = lr/epsilon
+    
     device = model_params[0].device
     
     # Get macro_batch_size - default to 1 if not provided
@@ -914,25 +917,33 @@ def cdrge_optimize(model_params,
             else:
                 v_hat = 1.0
                 
-            param.data.add_( m_hat / v_hat )
+            param.data.add_( lr_to_eta_ratio * m_hat / v_hat )
+
+            # ---- Decoupled weight decay (AdamW style) --------------------
+            if hasattr(args, "weight_decay") and args.weight_decay > 0.0:
+                # Skip 1-D tensors (biases, LayerNorm/BatchNorm weights)
+                if param.ndim > 1:
+                    param.data.add_(param.data, alpha = -lr * args.weight_decay)
 
 
     
 
     else: # calculate this post from the seeds
-        for idx, param in enumerate(model_params):
-            # grad = None
-            for j in range(num_perturbations):
-                seed  = all_seeds[j] + idx
-                coeff = grad_estimate_list[j]                 # (f⁺−f⁻)/2n # no ε bc ε == lr and they cancel out
+        raise Exception("This branch is no longer maintained. Need to implement momentum and var and weight decay")
         
-                # ── NEW: accumulate probe chunk-by-chunk ─────────────────────
-                for chunk in torch.split(param, CHUNK_SIZE, dim=0):     # 8k rows
-                    probe = generate_perturbation(
-                                chunk, coeff, distribution, seed)
-                    chunk.add_(probe) 
+        # for idx, param in enumerate(model_params):
+        #     # grad = None
+        #     for j in range(num_perturbations):
+        #         seed  = all_seeds[j] + idx
+        #         coeff = grad_estimate_list[j]                 # (f⁺−f⁻)/2n # no ε bc ε == lr and they cancel out
         
-                # grad = probe if grad is None else grad + probe
+        #         # ── NEW: accumulate probe chunk-by-chunk ─────────────────────
+        #         for chunk in torch.split(param, CHUNK_SIZE, dim=0):     # 8k rows
+        #             probe = generate_perturbation(
+        #                         chunk, lr_to_eta_ratio * coeff, distribution, seed)
+        #             chunk.add_(probe) 
+        
+        #         # grad = probe if grad is None else grad + probe
 
 
     if is_verbose:
@@ -953,7 +964,7 @@ def cdrge_optimize(model_params,
 def cdrge_no_chunking(model_params, loss_fn, lr, epsilon, iterations, num_perturbations=20,
                    distribution='rad', antithetic=False, use_adaptive_step=False, clip_grad_norm=0.0,
                    args=None):
-    """Central Difference Random Gradient Estimation optimization
+    """DO NOT USE ... LIKELY: Central Difference Random Gradient Estimation optimization
 
     A memory-efficient implementation that avoids parameter copies
     and uses seeded RNG for consistent perturbations.
@@ -1533,8 +1544,8 @@ def train_step(model, args, batch_np, loss_closure, optimizer=None):
             return cdrge_optimize( 
                 model_params      = list(model.parameters()),
                 loss_fn           = loss_closure,
-                lr                = args.learning_rate_and_epsilon,
-                epsilon           = args.learning_rate_and_epsilon,
+                lr                = args.learning_rate,
+                epsilon           = args.epsilon,
                 iterations        = 1,
                 num_perturbations = args.num_perturbations,
                 distribution      = args.distribution,
@@ -1551,8 +1562,8 @@ def train_step(model, args, batch_np, loss_closure, optimizer=None):
             return SPSA1_5( 
                 model_params      = list(model.parameters()),
                 loss_fn           = loss_closure,
-                lr                = args.learning_rate_and_epsilon,
-                epsilon           = args.learning_rate_and_epsilon,
+                lr                = args.learning_rate,
+                epsilon           = args.epsilon,
                 iterations        = 1,
                 num_perturbations = args.num_perturbations,
                 distribution      = args.distribution,
@@ -1570,8 +1581,8 @@ def train_step(model, args, batch_np, loss_closure, optimizer=None):
             return SPSA2( 
                 model_params      = list(model.parameters()),
                 loss_fn           = loss_closure,
-                lr                = args.learning_rate_and_epsilon,
-                epsilon           = args.learning_rate_and_epsilon,
+                lr                = args.learning_rate,
+                epsilon           = args.epsilon,
                 iterations        = 1,
                 num_perturbations = args.num_perturbations,
                 distribution      = args.distribution,
@@ -1731,6 +1742,43 @@ def train(args):
             device       = device,
             dtype        = dtype,
         )
+    
+    elif args.model_type == "Transformer":
+        model = Transformer(
+            input_size   = args.input_size,
+            output_size  = tok.vocab_size,
+            hidden_size  = args.hidden_size,
+            memory_size  = args.memory_size,
+            head_size    = args.head_size,
+            num_heads    = args.num_heads,
+            embed        = embed,
+            device       = device,
+            dtype        = dtype,
+        )
+    elif args.model_type == "Mamba":
+        model = Mamba(
+            input_size   = args.input_size,
+            output_size  = tok.vocab_size,
+            hidden_size  = args.hidden_size,
+            memory_size  = args.memory_size,
+            head_size    = args.head_size,
+            num_heads    = args.num_heads,
+            embed        = embed,
+            device       = device,
+            dtype        = dtype,
+        )
+    elif args.model_type == "SSM":
+        model = SSM(
+            input_size   = args.input_size,
+            output_size  = tok.vocab_size,
+            hidden_size  = args.hidden_size,
+            memory_size  = args.memory_size,
+            head_size    = args.head_size,
+            num_heads    = args.num_heads,
+            embed        = embed,
+            device       = device,
+            dtype        = dtype,
+        )
     else:
         raise ValueError(f"Unknown model_type {args.model_type}")
     
@@ -1769,8 +1817,6 @@ def train(args):
     
     # Main training loop
     print(f"Starting training for task: {args.task}")
-    print(f"Model config: hidden_size={args.hidden_size}, heads={args.num_heads}, dim_per_head={args.head_size}")
-    print(f"Optimization: learning_rate_and_epsilon={args.learning_rate_and_epsilon}, perturbations={args.num_perturbations}, distribution={args.distribution}")
     print("="*50)
     print(args)
     print("="*50)
@@ -1829,19 +1875,19 @@ def train(args):
             print("Using AdamW")
             optimizer = torch.optim.AdamW(
                 model_params, 
-                lr=args.learning_rate_and_epsilon,
-                betas=(0.99, 0.999),
+                lr=args.learning_rate,
+                betas=(args.beta1, args.beta2),
                 eps=1e-8,  # Slightly larger epsilon for stability
-                weight_decay=0.0,  
+                weight_decay=args.weight_decay,  
                 amsgrad=False  # Disable amsgrad to save memory
             )
         else:
             print("Using vanilla SGD")
             optimizer = torch.optim.SGD(
                 model_params, 
-                lr=args.learning_rate_and_epsilon,
-                momentum=0.0, 
-                weight_decay=0.0
+                lr=args.learning_rate,
+                momentum=args.beta1, 
+                weight_decay=args.weight_decay
             )
     else:
         optimizer = None
@@ -1945,7 +1991,8 @@ def train(args):
                 wandb_metrics = {
                     "train_loss": step_metrics['train_loss'][-1],
                     "train_acc": train_accuracy,
-                    "lr": args.learning_rate_and_epsilon,
+                    "lr": args.learning_rate,
+                    "epsilon": args.epsilon,
                     "iter_time_s": iteration_time,
                     "total_time_hours": total_elapsed / 3600.0,
                     "grad_norm": step_metrics.get('grad_norm', [0])[-1] if step_metrics.get('grad_norm') else 0,
@@ -1968,6 +2015,8 @@ def train(args):
     results['train_metrics']['accuracy'].append(final_accuracy)
     results['train_metrics']['iterations'].append(total_iterations)
     results['train_metrics']['time'].append(0)
+    results['param_count'] = param_count
+    
     results["status"] = status
 
     print(f"Final loss (after training): {final_loss:.4f}, Accuracy: {final_accuracy:.4f}")
@@ -2022,73 +2071,73 @@ def run_unittest(args):
             ### DNC TESTS
             # ========================= DNC BPTT ===================================== #
             # "tiny-bptt-default-dnc":   dict(model_size="tiny",   hidden_size=240,   num_heads=12,  head_size=20, memory_size=128, model_type="DNC",
-            #                             solver="BPTT", use_adam=False, learning_rate_and_epsilon=0.01,   micro_batch_size=int(batch_size/1), macro_batch_size=1,
+            #                             solver="BPTT", use_adam=False, learning_rate=0.01, epsilon=0.01,   micro_batch_size=int(batch_size/1), macro_batch_size=1,
             #                             description="Tiny dnc with BPTT"),
             # "small-bptt-default-dnc":  dict(model_size="small",  hidden_size=1600,  num_heads=32,  head_size=50, model_type="DNC",
-            #                            solver="BPTT", use_adam=False, learning_rate_and_epsilon=0.01,  micro_batch_size=int(batch_size/1), macro_batch_size=1,
+            #                            solver="BPTT", use_adam=False, learning_rate=0.01, epsilon=0.01, learning_rate_and_epsilon=0.01,  micro_batch_size=int(batch_size/1), macro_batch_size=1,
             #                             description="Small dnc with BPTT "),
             # "medium-bptt-default-dnc": dict(model_size="medium", hidden_size=9600,  num_heads=64,  head_size=150, model_type="DNC",
-            #                             solver="BPTT", use_adam=False, learning_rate_and_epsilon=0.0001,  micro_batch_size=int(batch_size/1), macro_batch_size=1,
+            #                             solver="BPTT", use_adam=False, learning_rate=0.0001, epsilon=0.0001,   micro_batch_size=int(batch_size/1), macro_batch_size=1,
             #                             description="Medium dnc with BPTT "),
             # "medium-bptt-default-dnc": dict(model_size="medium", hidden_size=9600,  num_heads=64,  head_size=150, model_type="DNC",
-            #                                 solver="BPTT", use_adam=True, learning_rate_and_epsilon=0.0001,  micro_batch_size=int(batch_size/1), macro_batch_size=1,
+            #                                 solver="BPTT", use_adam=True, learning_rate=0.0001, epsilon=0.0001,  micro_batch_size=int(batch_size/1), macro_batch_size=1,
             #                                 description="Medium dnc with BPTT with Adam"),
             
             # ========================= DNC cdrge-96 ================================= #
             "tiny-cdrge96-default-dnc":  dict(model_size="tiny",   hidden_size=240,   num_heads=12,  head_size=20, memory_size=128, model_type="DNC",
-                                          learning_rate_and_epsilon=0.01,   #.01 for 1SPSA,  
+                                          learning_rate=0.01, epsilon=0.01,   #.01 for 1SPSA,  
                                               micro_batch_size=int(batch_size/1), macro_batch_size=1,
                                           num_perturbations=96,  antithetic=False,
                                           description="Tiny dnc with cdrge@96"),
             # "small-cdrge96-default-dnc": dict(model_size="small",  hidden_size=1600,  num_heads=32,  head_size=50, memory_size=128, model_type="DNC",
-            #                               learning_rate_and_epsilon=0.001,  micro_batch_size=int(batch_size/1), macro_batch_size=1,
+            #                               learning_rate=0.001, epsilon=0.001,  micro_batch_size=int(batch_size/1), macro_batch_size=1,
             #                               num_perturbations=96,  antithetic=False,
             #                               description="Small dnc with cdrge@96"),
             # "medium-cdrge96-default-dnc":dict(model_size="medium", hidden_size=9600,  num_heads=64,  head_size=150, memory_size=128, model_type="DNC",
-            #                               learning_rate_and_epsilon=0.001,  micro_batch_size=int(batch_size/1), macro_batch_size=1,
+            #                               learning_rate=0.001, epsilon=0.001,  micro_batch_size=int(batch_size/1), macro_batch_size=1,
             #                               num_perturbations=96,  antithetic=False,
             #                               description="Medium dnc with cdrge@96"),
             # "large-cdrge96-default-dnc": dict(model_size="large",  hidden_size=2**13, num_heads=1,  head_size=0, memory_size=2**13, model_type="DNC",
-            #                               learning_rate_and_epsilon=0.001,  micro_batch_size=int(batch_size/1), macro_batch_size=1,
+            #                               learning_rate=0.001, epsilon=0.001,  micro_batch_size=int(batch_size/1), macro_batch_size=1,
             #                               num_perturbations=96,  antithetic=False,
             #                               description="Large dnc with cdrge@96"),
             # 2.4B  with  hidden_size=2**14, num_heads=2**8, head_size=0,
             # "xlarge-cdrge96-default-dnc":dict(model_size="xlarge", hidden_size=2**14, num_heads=2**8, head_size=0, memory_size=128, model_type="DNC",
-            #                               learning_rate_and_epsilon=0.001,  micro_batch_size=int(batch_size/1), macro_batch_size=1,
+            #                               learning_rate=0.001, epsilon=0.001,  micro_batch_size=int(batch_size/1), macro_batch_size=1,
             #                               num_perturbations=96,  antithetic=False,
             #                               description="XLarge dnc with cdrge@96"),
             # 10B  with  hidden_size=2**15, num_heads=2**9, head_size=0,
             # "xxlarge-cdrge96-default-dnc":dict(model_size="xxlarge", hidden_size=2**15, num_heads=2**10, head_size=0, memory_size=128, model_type="DNC",
-            #                               learning_rate_and_epsilon=0.0001,  micro_batch_size=int(batch_size/1), macro_batch_size=1,
+            #                               learning_rate=0.0001, epsilon=0.0001, micro_batch_size=int(batch_size/1), macro_batch_size=1,
             #                               num_perturbations=96,  antithetic=False,
             #                               description="XXLarge dnc with cdrge@96"),
         
             # ========================= DNC cdrge-512 ================================ #
             "tiny-cdrge512-default-dnc":  dict(model_size="tiny",   hidden_size=240,   num_heads=12,  head_size=20, memory_size=128, model_type="DNC",
-                                           learning_rate_and_epsilon=0.01,   #.1 for 1SPSA,  
+                                           learning_rate=0.01, epsilon=0.01, #.1 for 1SPSA,  
                                                micro_batch_size=int(batch_size/1), macro_batch_size=1,
                                            num_perturbations=512, antithetic=False,
                                            description="Tiny dnc with cdrge@512"),
             # "small-cdrge512-default-dnc": dict(model_size="small",  hidden_size=1600,  num_heads=32,  head_size=50, memory_size=128, model_type="DNC",
-            #                                learning_rate_and_epsilon=0.01,  micro_batch_size=int(batch_size/1), macro_batch_size=1,
+            #                                learning_rate=0.01, epsilon=0.01,   micro_batch_size=int(batch_size/1), macro_batch_size=1,
             #                                num_perturbations=512, antithetic=False,
             #                                description="Small dnc with cdrge@512"),
             # "medium-cdrge512-default-dnc":dict(model_size="medium", hidden_size=9600,  num_heads=64,  head_size=150, memory_size=128, model_type="DNC",
-            #                                learning_rate_and_epsilon=0.001,  micro_batch_size=int(batch_size/1), macro_batch_size=1,
+            #                                learning_rate=0.001, epsilon=0.001, micro_batch_size=int(batch_size/1), macro_batch_size=1,
             #                                num_perturbations=512, antithetic=False,
             #                                description="Medium dnc with cdrge@512"),
             # "large-cdrge512-default-dnc": dict(model_size="large",  hidden_size=66000, num_heads=220,  head_size=300, memory_size=128, model_type="DNC",
-            #                                learning_rate_and_epsilon=0.001, micro_batch_size=int(batch_size/1), macro_batch_size=1,
+            #                                learning_rate=0.001, epsilon=0.001,  micro_batch_size=int(batch_size/1), macro_batch_size=1,
             #                                num_perturbations=512, antithetic=False,
             #                                description="Large dnc with cdrge@512"),
             # 2.4B  with  hidden_size=2**14, num_heads=2**8, head_size=0,
             # "xlarge-cdrge512-default-dnc":dict(model_size="xlarge", hidden_size=2**14, num_heads=2**8, head_size=0, memory_size=128, model_type="DNC",
-            #                               learning_rate_and_epsilon=0.001,  micro_batch_size=int(batch_size/1), macro_batch_size=1,
+            #                               learning_rate=0.001, epsilon=0.001,   micro_batch_size=int(batch_size/1), macro_batch_size=1,
             #                               num_perturbations=512,  antithetic=False,
             #                               description="XLarge dnc with cdrge@96"),
             # 10B  with  hidden_size=2**15, num_heads=2**9, head_size=0,
             # "xxlarge-cdrge96-default-dnc":dict(model_size="xxlarge", hidden_size=2**15, num_heads=2**10, head_size=0, memory_size=128, model_type="DNC",
-            #                               learning_rate_and_epsilon=0.001,  micro_batch_size=int(batch_size/1), macro_batch_size=1,
+            #                               learning_rate=0.001, epsilon=0.001,  micro_batch_size=int(batch_size/1), macro_batch_size=1,
             #                               num_perturbations=512,  antithetic=False,
             #                               description="XXLarge dnc with cdrge@512"),
 
@@ -2096,56 +2145,56 @@ def run_unittest(args):
             # ========================= LSTM BPTT ===================================== #
             
             "tiny-bptt-default-lstm":   dict(model_size="tiny",   hidden_size=240,   num_heads=12,  head_size=20, model_type="LSTM",
-                                        solver="BPTT", use_adam=True, learning_rate_and_epsilon=0.01,   micro_batch_size=int(batch_size/1), macro_batch_size=1,
+                                        solver="BPTT", use_adam=True, learning_rate=0.01, epsilon=0.01,   micro_batch_size=int(batch_size/1), macro_batch_size=1,
                                         description="Tiny lstm with BPTT"),
             # "small-bptt-default-lstm":  dict(model_size="small",  hidden_size=1600,  num_heads=32,  head_size=50, model_type="LSTM",
-            #                             solver="BPTT", use_adam=True, learning_rate_and_epsilon=0.01,  micro_batch_size=int(batch_size/1), macro_batch_size=1,
+            #                             solver="BPTT", use_adam=True, learning_rate=0.01, epsilon=0.01,  micro_batch_size=int(batch_size/1), macro_batch_size=1,
             #                             description="Small lstm with BPTT"),
             # "medium-bptt-default-lstm": dict(model_size="medium", hidden_size=9600,  num_heads=64,  head_size=150,model_type="LSTM",
-            #                             solver="BPTT", use_adam=True, learning_rate_and_epsilon=0.001,  micro_batch_size=int(batch_size/128), macro_batch_size=128,
+            #                             solver="BPTT", use_adam=True, learning_rate=0.001, epsilon=0.001, micro_batch_size=int(batch_size/128), macro_batch_size=128,
             #                             description="Medium lstm with BPTT - optimized for GPU memory constraints"),
             
             # ========================= LSTM cdrge-96 ================================= #
             "tiny-cdrge96-default-lstm":  dict(model_size="tiny",   hidden_size=240,   num_heads=12,  head_size=20,model_type="LSTM",
-                                          learning_rate_and_epsilon=0.1,   micro_batch_size=int(batch_size/1), macro_batch_size=1,
+                                          learning_rate=0.1, epsilon=0.1,    micro_batch_size=int(batch_size/1), macro_batch_size=1,
                                           num_perturbations=96,  antithetic=False,
                                           description="Tiny lstm with cdrge@96"),
             # "small-cdrge96-default-lstm": dict(model_size="small",  hidden_size=1600,  num_heads=32,  head_size=50,model_type="LSTM",
-            #                               learning_rate_and_epsilon=0.01,  micro_batch_size=int(batch_size/1), macro_batch_size=1,
+            #                               learning_rate=0.01, epsilon=0.01, micro_batch_size=int(batch_size/1), macro_batch_size=1,
             #                               num_perturbations=96,  antithetic=False,
             #                               description="Small lstm with cdrge@96"),
             # "medium-cdrge96-default-lstm":dict(model_size="medium", hidden_size=9600,  num_heads=64,  head_size=150,model_type="LSTM",
-            #                               learning_rate_and_epsilon=0.01,  micro_batch_size=int(batch_size/1), macro_batch_size=1,
+            #                               learning_rate=0.01, epsilon=0.01,  micro_batch_size=int(batch_size/1), macro_batch_size=1,
             #                               num_perturbations=96,  antithetic=False,
             #                               description="Medium lstm with cdrge@96"),
             # "large-cdrge96-default-lstm": dict(model_size="large",  hidden_size=66000, num_heads=220,  head_size=300,model_type="LSTM",
-            #                               learning_rate_and_epsilon=0.01,  micro_batch_size=int(batch_size/1), macro_batch_size=1,
+            #                               learning_rate=0.01, epsilon=0.01,   micro_batch_size=int(batch_size/1), macro_batch_size=1,
             #                               num_perturbations=96,  antithetic=False,
             #                               description="Large lstm with cdrge@96"),
             # "xlarge-cdrge96-default-lstm":dict(model_size="xlarge", hidden_size=297500, num_heads=350, head_size=850,model_type="LSTM",
-            #                               learning_rate_and_epsilon=0.01,  micro_batch_size=int(batch_size/1), macro_batch_size=1,
+            #                               learning_rate=0.01, epsilon=0.01,  micro_batch_size=int(batch_size/1), macro_batch_size=1,
             #                               num_perturbations=96,  antithetic=False,
             #                               description="XLarge lstm with cdrge@96"),
         
             # ========================= LSTM cdrge-512 ================================ #
             "tiny-cdrge512-default-lstm":  dict(model_size="tiny",   hidden_size=240,   num_heads=12,  head_size=20,model_type="LSTM",
-                                           learning_rate_and_epsilon=0.1,   micro_batch_size=int(batch_size/1), macro_batch_size=1,
+                                           learning_rate=0.01, epsilon=0.01,   micro_batch_size=int(batch_size/1), macro_batch_size=1,
                                            num_perturbations=512, antithetic=False,
                                            description="Tiny lstm with cdrge@512"),
             # "small-cdrge512-default-lstm": dict(model_size="small",  hidden_size=1600,  num_heads=32,  head_size=50,model_type="LSTM",
-            #                                learning_rate_and_epsilon=0.1,  micro_batch_size=int(batch_size/1), macro_batch_size=1,
+            #                                learning_rate=0.01, epsilon=0.01,  micro_batch_size=int(batch_size/1), macro_batch_size=1,
             #                                num_perturbations=512, antithetic=False,
             #                                description="Small lstm with cdrge@512"),
             # "medium-cdrge512-default-lstm":dict(model_size="medium", hidden_size=9600,  num_heads=64,  head_size=150,model_type="LSTM",
-            #                                learning_rate_and_epsilon=0.01,  micro_batch_size=int(batch_size/1), macro_batch_size=1,
+            #                                learning_rate=0.01, epsilon=0.01,   micro_batch_size=int(batch_size/1), macro_batch_size=1,
             #                                num_perturbations=512, antithetic=False,
             #                                description="Medium lstm with cdrge@512"),
             # "large-cdrge512-default-lstm": dict(model_size="large",  hidden_size=66000, num_heads=220,  head_size=300,model_type="LSTM",
-            #                                learning_rate_and_epsilon=0.01, micro_batch_size=int(batch_size/1), macro_batch_size=1,
+            #                                learning_rate=0.01, epsilon=0.01,  micro_batch_size=int(batch_size/1), macro_batch_size=1,
             #                                num_perturbations=512, antithetic=False,
             #                                description="Large lstm with cdrge@512"),
             # "xlarge-cdrge512-default-lstm":dict(model_size="xlarge", hidden_size=297500, num_heads=350, head_size=850,model_type="LSTM",
-            #                                learning_rate_and_epsilon=0.01, micro_batch_size=int(batch_size/1), macro_batch_size=1,
+            #                                learning_rate=0.01, epsilon=0.01,  micro_batch_size=int(batch_size/1), macro_batch_size=1,
             #                                num_perturbations=512, antithetic=False,
             #                                description="XLarge lstm with cdrge@512"),
 
@@ -2256,7 +2305,7 @@ def get_argument_parser():
     parser.add_argument("--task", type=str, default="penn_tree_bank",
                         choices=["copy", "repeat_copy", "sort", "reverse", "add", "penn_tree_bank"])
     parser.add_argument("--model_type", type=str, default="LSTM",
-                        choices=["LSTM", "DNC"])
+                        choices=["LSTM", "DNC", "Transformer", "Mamba", "SSM"])
     parser.add_argument("--seq_length", type=int, default=10,
                         help="For generation.")
     parser.add_argument("--micro_batch_size", type=int, default=16)
@@ -2278,7 +2327,8 @@ def get_argument_parser():
     
     parser.add_argument("--distribution", type=str, default="rad",
                         choices=["rad", "normal", "uniform"])
-    parser.add_argument("--learning_rate_and_epsilon", type=float, default=0.01)
+    parser.add_argument("--epsilon", type=float, default=0.01)
+    parser.add_argument("--learning_rate", type=float, default=0.01)
     parser.add_argument("--saturating_alpha", type=float, default=1.0)
     parser.add_argument("--num_perturbations", type=int, default=20)
     parser.add_argument("--antithetic_sampling", action="store_true")
@@ -2287,6 +2337,7 @@ def get_argument_parser():
     parser.add_argument("--grad_clip", type=float, default=0.0)
     parser.add_argument("--beta1", type=float, default=0.0, help="for momentum")
     parser.add_argument("--beta2", type=float, default=0.0, help="for RMSProp-style variance")
+    parser.add_argument("--weight_decay", type=float, default=0.0, help="l2 weight decay")
     parser.add_argument("--use_adam", action="store_true", default=False,
                         help="Use Adam optimizer vs. vanilla SGD")
     parser.add_argument("--overfit_to_one_batch_flag", action="store_true", default=False,
@@ -2312,8 +2363,8 @@ def get_argument_parser():
     # Unit Test
     parser.add_argument("--unit_test", action="store_true")
 
-    # Logging
-    parser.add_argument("--output_dir", type=str, default="./results_copy/")
+    # Logging 
+    parser.add_argument("--output_dir", type=str, default="./results_default/")
     parser.add_argument("--oom_backoff_sec", type=int, default=600) # 10 min
     parser.add_argument("--oom_max_retries", type=int, default=1000)
 
@@ -2369,7 +2420,7 @@ def main() -> None:
     # output dir --------------------------------------------------------
     out_root = pathlib.Path(args.output_dir).expanduser()
     out_root.mkdir(parents=True, exist_ok=True)
-    seed_hash = hashlib.md5(str(args.seed).encode()).hexdigest()[:6]
+    seed_hash = hashlib.md5((str(args.seed) + str(args)).encode()).hexdigest()[:6]
     run_prefix = args.wandb_run_name or "run"
     base_name = f"{run_prefix}_{seed_hash}"          # everything else added later
 
