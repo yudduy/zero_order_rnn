@@ -191,7 +191,7 @@ class LSTM(nn.Module):
 #  Differentiable Neural Computer                                             #
 # --------------------------------------------------------------------------- #
 class DNC(nn.Module):
-    def __init__(self, input_size, output_size, hidden_size, memory_size, head_size, num_heads, embed, device=None, dtype=torch.bfloat16):
+    def __init__(self, input_size, output_size, hidden_size, memory_size, head_size, num_heads, embed, device=None, dtype=torch.float):
             super(DNC, self).__init__()
        
             # with torch.inference_mode():
@@ -365,3 +365,258 @@ class DNC(nn.Module):
     
             outputs = torch.cat(outputs, dim=1)
             return outputs, memory, hidden
+
+
+
+
+
+
+
+
+####################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################
+# import math, contextlib, torch
+# import torch.nn as nn
+# from typing import Optional, Tuple, List
+
+# # Import off-the-shelf implementations
+# try:
+#     from mamba_ssm import Mamba as MambaBlock
+#     # If available, import Mamba's optimized RMSNorm (falls back to None if not present)
+#     try:
+#         from mamba_ssm.ops.triton.layernorm import RMSNorm as MambaRMSNorm
+#     except ImportError:
+#         MambaRMSNorm = None
+# except ImportError as e:
+#     raise ImportError("Mamba-SSM library is not installed. Please install mamba-ssm to use the Mamba class.") from e
+
+# try:
+#     from s5 import S5 as SSMCore
+# except ImportError as e:
+#     raise ImportError("S5 library is not installed. Please install s5-pytorch to use the SSM class.") from e
+
+# # ---------------------------------------------------------------------------
+# # 1) Transformer (Encoder)
+# # ---------------------------------------------------------------------------
+# class Transformer(nn.Module):
+#     """Transformer encoder using PyTorch's nn.TransformerEncoder."""
+#     def __init__(
+#         self,
+#         input_size:  int,
+#         output_size: int,
+#         hidden_size: int,
+#         memory_size: int,   # not used in Transformer
+#         head_size:   int,
+#         num_heads:   int,
+#         embed:       nn.Embedding,
+#         device:      torch.device | None = None,
+#         dtype:       torch.dtype = torch.bfloat16,
+#         n_layers:    int = 1
+#     ):
+#         super().__init__()
+#         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+#         self.dtype  = dtype
+
+#         # Store interface attributes
+#         self.input_size  = input_size
+#         self.output_size = output_size
+#         self.hidden_size = hidden_size
+#         self.memory_size = memory_size  # not used
+#         self.head_size   = head_size if head_size > 0 else hidden_size // num_heads
+#         self.num_heads   = num_heads
+#         self.embed       = embed.to(self.device)
+
+#         if hidden_size % num_heads != 0:
+#             raise ValueError("hidden_size must be divisible by num_heads")
+
+#         # Input projection (if embedding size E != hidden size H)
+#         self.in_proj = nn.Linear(input_size, hidden_size, device=self.device, dtype=dtype) \
+#                        if input_size != hidden_size else nn.Identity()
+
+#         # Fixed sinusoidal positional encoding (precomputed for max length)
+#         max_len = 8192
+#         pos = torch.arange(max_len, dtype=torch.float32, device=self.device).unsqueeze(1)
+#         div = torch.exp(torch.arange(0, hidden_size, 2, dtype=torch.float32, device=self.device)
+#                         * (-math.log(10000.0) / hidden_size))
+#         pe = torch.zeros(max_len, hidden_size, dtype=dtype, device=self.device)
+#         pe[:, 0::2] = torch.sin(pos * div)
+#         pe[:, 1::2] = torch.cos(pos * div)
+#         self.register_buffer("pos_enc", pe, persistent=False)
+
+#         # Transformer encoder layers (using PyTorch's built-in implementation)
+#         encoder_layer = nn.TransformerEncoderLayer(
+#             d_model=hidden_size, nhead=num_heads, dim_feedforward=4 * hidden_size,
+#             dropout=0.0, batch_first=True, device=self.device, dtype=dtype
+#         )
+#         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+#         self.out_proj = nn.Linear(hidden_size, output_size, device=self.device, dtype=dtype)
+
+#     def forward(
+#         self,
+#         x_emb: torch.Tensor,                # [B, T, E] input embeddings
+#         hidden: Optional[Tuple] = None,     # (unused for Transformer)
+#         memory: Optional[torch.Tensor] = None,  # (unused for Transformer)
+#         require_gradients: bool = False
+#     ) -> Tuple[torch.Tensor, None, None]:
+#         # The Transformer encoder doesn't use hidden or memory; we include them for interface compatibility.
+#         with (torch.no_grad() if not require_gradients else contextlib.nullcontext()):
+#             # Project to hidden size and add positional encoding
+#             x = self.in_proj(x_emb.to(self.dtype))
+#             x = x + self.pos_enc[: x.size(1)]
+#             # Pass through Transformer encoder stack
+#             y = self.encoder(x)
+#             # Project to output vocabulary or feature size
+#             logits = self.out_proj(y)
+#             return logits, None, None
+
+# # ---------------------------------------------------------------------------
+# # 2) Mamba (State-Space Model with gating and convolution)
+# # ---------------------------------------------------------------------------
+# class Mamba(nn.Module):
+#     """
+#     Mamba sequence model using the official mamba-ssm implementation.
+#     This wraps one or more Mamba blocks to fit the (input_size,..., embed, device, dtype) interface.
+#     """
+#     def __init__(
+#         self,
+#         input_size: int,
+#         output_size: int,
+#         hidden_size: int,
+#         memory_size: int,  # not used (for interface consistency)
+#         head_size: int,    # not used
+#         num_heads: int,    # not used
+#         embed: nn.Embedding,
+#         device: torch.device | None = None,
+#         dtype: torch.dtype = torch.bfloat16,
+#         n_layers: int = 1,
+#         state_size: int = 16,
+#         conv_size: int = 4,
+#         expand_factor: int = 2
+#     ):
+#         super().__init__()
+#         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+#         self.input_size  = input_size
+#         self.output_size = output_size
+#         self.hidden_size = hidden_size
+#         self.memory_size = memory_size
+#         self.head_size   = head_size
+#         self.num_heads   = num_heads
+#         self.embed       = embed.to(self.device)
+#         self.dtype       = dtype
+
+#         # Input projection if input embedding size != hidden size
+#         self.input_proj = nn.Linear(input_size, hidden_size, device=self.device, dtype=dtype) \
+#                           if input_size != hidden_size else nn.Identity()
+
+#         # Stack of Mamba blocks from the library
+#         self.layers = nn.ModuleList([
+#             MambaBlock(
+#                 d_model=hidden_size,
+#                 d_state=state_size,
+#                 d_conv=conv_size,
+#                 expand=expand_factor
+#             ).to(self.device) for _ in range(n_layers)
+#         ])
+
+#         # Use Mamba's RMSNorm if available, otherwise default to LayerNorm
+#         if 'MambaRMSNorm' in globals() and MambaRMSNorm is not None:
+#             self.norm = MambaRMSNorm(hidden_size, eps=1e-5, device=self.device, dtype=dtype)
+#         else:
+#             self.norm = nn.LayerNorm(hidden_size, eps=1e-5, device=self.device, dtype=dtype)
+
+#         self.output_proj = nn.Linear(hidden_size, output_size, device=self.device, dtype=dtype)
+
+#     def forward(
+#         self,
+#         x_emb: torch.Tensor, 
+#         hidden: Optional[List] = None,   # list of per-layer states (not explicitly used in this wrapper)
+#         memory: Optional[torch.Tensor] = None,  # not used
+#         require_gradients: bool = False
+#     ) -> Tuple[torch.Tensor, None, Optional[List]]:
+#         """
+#         x_emb: [B, T, input_size] input sequence embeddings.
+#         hidden: (optional) list of hidden states for each layer (each state is typically a tuple for conv/SSM states).
+#                 Not required for full-sequence processing; the Mamba blocks handle state internally.
+#         """
+#         with (torch.no_grad() if not require_gradients else contextlib.nullcontext()):
+#             x = self.input_proj(x_emb.to(self.dtype))
+#             for layer in self.layers:
+#                 # Each Mamba block processes the sequence; we are not explicitly passing or retrieving state here.
+#                 x = layer(x)
+#             x = self.norm(x)
+#             logits = self.output_proj(x)
+#             # We do not expose Mamba internal states in this simple wrapper (hidden returns as None).
+#             return logits, None, None
+
+# # ---------------------------------------------------------------------------
+# # 3) SSM (Linear State-Space Model)
+# # ---------------------------------------------------------------------------
+# class SSM(nn.Module):
+#     """Linear State-Space Model using the S5 implementation."""
+#     def __init__(
+#         self,
+#         input_size: int,
+#         output_size: int,
+#         hidden_size: int,
+#         memory_size: int,  # not used
+#         head_size: int,    # not used
+#         num_heads: int,    # not used
+#         embed: nn.Embedding,
+#         device: torch.device | None = None,
+#         dtype: torch.dtype = torch.bfloat16,
+#         state_size: int = 16    # (SSM internal state size, not directly used by S5 in this wrapper)
+#     ):
+#         super().__init__()
+#         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+#         self.input_size  = input_size
+#         self.output_size = output_size
+#         self.hidden_size = hidden_size
+#         self.memory_size = memory_size
+#         self.head_size   = head_size
+#         self.num_heads   = num_heads
+#         self.embed       = embed.to(self.device)
+#         self.dtype       = dtype
+
+#         # Linear layers for input and output
+#         self.input_proj = nn.Linear(input_size, hidden_size, device=self.device, dtype=dtype) \
+#                           if input_size != hidden_size else nn.Identity()
+#         self.output_proj = nn.Linear(hidden_size, output_size, device=self.device, dtype=dtype)
+
+#         # Normalization before feeding into SSM (using LayerNorm with small epsilon)
+#         self.norm = nn.LayerNorm(input_size, eps=1e-6, device=self.device, dtype=dtype)
+
+#         # SSM core (S5 layer)
+#         # Note: The S5 constructor internally decides the state dimension. The state_size parameter here is kept for interface,
+#         # but we do not explicitly pass it to S5 (one could modify S5 initialization if needed).
+#         self.ssm = SSMCore(hidden_size, hidden_size).to(self.device)
+
+#     def forward(
+#         self,
+#         x_emb: torch.Tensor,
+#         hidden: Optional[torch.Tensor] = None,   # optional initial state for SSM (shape depends on S5 internals)
+#         memory: Optional[torch.Tensor] = None,   # not used
+#         require_gradients: bool = False
+#     ) -> Tuple[torch.Tensor, None, Optional[torch.Tensor]]:
+#         """
+#         x_emb: [B, T, input_size] input sequence.
+#         hidden: optional tensor representing the previous state of the SSM (for continuing sequences).
+#         Returns:
+#             logits: [B, T, output_size] output sequence after the SSM and projection.
+#             memory: None (not used in this model).
+#             new_hidden: the new state tensor after processing this sequence (can be fed as `hidden` next call).
+#         """
+#         with (torch.no_grad() if not require_gradients else contextlib.nullcontext()):
+#             # Normalize and project input to hidden size
+#             x = self.norm(x_emb.to(self.dtype))
+#             x = self.input_proj(x)
+#             # Pass through the SSM layer (with initial state if provided)
+#             if hidden is not None:
+#                 result = self.ssm(x, hidden)
+#             else:
+#                 result = self.ssm(x)
+#             # The S5 layer may return (output, final_state) or just output
+#             if isinstance(result, tuple):
+#                 y, new_hidden = result
+#             else:
+#                 y, new_hidden = result, None
+#             logits = self.output_proj(y)
+#             return logits, None, new_hidden
