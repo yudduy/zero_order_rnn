@@ -12,7 +12,7 @@ echo "[INFO] Starting runs..."
 
 
 ########## RUN PREFIX #############
-RUN_PREFIX="test_" 
+RUN_PREFIX="copy_" 
 
 
 # Define hyperparameter arrays (adjust these values as needed):
@@ -20,8 +20,8 @@ TASKS=("copy") # can use copy, reverse, sort, add, penn_treebank, etc..
 # ARCHITECTURES=("Transformer" "Mamba" "SSM") # can use DNC and LSTM only right now
 ARCHITECTURES=("DNC")
 
-# MODEL_SCALES=(1 2 4 8 16 32 64 128 256) # Can choose anything here from 1 to 64: MODEL_SCALES=(1 2 4 8 16 32 64) 
-MODEL_SCALES=(8)
+MODEL_SCALES=(32) # Can choose anything here from 1 to 64: MODEL_SCALES=(1 2 4 8 16 32 64) 
+# MODEL_SCALES=(64)
 hidden_size=128
 memory_size=128
 head_size=128
@@ -29,24 +29,33 @@ num_heads=1
 input_dim=32
 variance_reduction=1.
 
-INPUT_SAMPLE_LENGTHS=(100)
+INPUT_SAMPLE_LENGTHS=(1024)
 MICRO_BATCH_SIZES=(1)
 MACRO_BATCH_SIZES=(1)
 
-LEARNING_RATES=(0.001 0.0001)  # sweep LRs from 1e-5 to .1 here 
+LEARNING_RATES=(0.1 0.01 0.001 0.0001 )  # sweep LRs from 1e-5 to .1 here 
 # EPSILONS=(0.1 0.01 0.001 0.0001 0.00001)  # sweep LRs from 1e-5 to .1 here 
 # LEARNING_RATES=(0.1)  # sweep LRs from 1e-5 to .1 here 
 EPSILONS=(0.1)  # sweep LRs from 1e-5 to .1 here 
 
 MAX_NUMS=(120)
 # WARMUP_STEPS=(0) TO IMPLEMENT
-WEIGHT_DECAYS=(0. 0.0001)
+WEIGHT_DECAYS=(0)
 GRAD_CLIPS=(0)
-SOLVERS=("1SPSA") # "BPTT" "1SPSA" "1.5-SPSA" "2SPSA"
+SOLVERS=("1.5-SPSA") # "BPTT" "1SPSA" "1.5-SPSA" "2SPSA" "1.5-SPSA","Sanger-SPSA"
 
+BETA1s=(0.)
+BETA2s=(0.)
+PROBE_PROCONDITIONINGS=(false)
 
-NUM_PERTURBATIONS=(96)
+# SANGER_RANKS=(1 2 4 8 16)
+SANGER_RANKS=(1)
+alpha_eye_scalars=(1.0)
+beta_eigen_sangers=(0)
+
+NUM_PERTURBATIONS=(32 96 512)
 # NUM_PERTURBATIONS=(8 96 512)
+saturating_alphas=(1.0 0.5 0.1 0.01)
 
 OVERFITS=(true)
 
@@ -88,6 +97,13 @@ for TASK in "${TASKS[@]}"; do
                         for MACRO_BS in "${MACRO_BATCH_SIZES[@]}"; do
                             for LR in "${LEARNING_RATES[@]}"; do
                                 for EPS in "${EPSILONS[@]}"; do
+                                for PROBE_PROCONDITIONING in "${PROBE_PROCONDITIONINGS[@]}"; do
+                                for BETA1 in "${BETA1s[@]}"; do
+                                for BETA2 in "${BETA2s[@]}"; do
+                                for SANGER_RANK in "${SANGER_RANKS[@]}"; do
+                                for beta_eigen_sanger in  "${beta_eigen_sangers[@]}"; do
+                                for saturating_alpha in "${saturating_alphas[@]}"; do
+                                for alpha_eye_scalar in "${alpha_eye_scalars[@]}"; do
                                     for MAX_NUM in "${MAX_NUMS[@]}"; do
                                         for WEIGHT_DECAY in "${WEIGHT_DECAYS[@]}"; do
                                             for GRAD_CLIP in "${GRAD_CLIPS[@]}"; do
@@ -111,7 +127,11 @@ for TASK in "${TASKS[@]}"; do
                                                   for numPert in "${NUM_PERTURBATIONS[@]}"; do
                                                       
 
-
+                                                    EXTRA_FLAGS=""
+                                                    if [ "$PROBE_PROCONDITIONING" = true ]; then
+                                                      EXTRA_FLAGS+=" --use_probe_preconditioning"
+                                                    fi
+                                                    
                                                     if [ "$ADAM" = true ]; then
                                                       EXTRA_FLAGS+=" --use_adam"
                                                     fi
@@ -165,28 +185,43 @@ for TASK in "${TASKS[@]}"; do
                                                           --log_interval ${LOG_INTERVAL} \
                                                           --learning_rate ${LR} \
                                                           --epsilon ${EPS} \
+                                                          --sanger_rank ${SANGER_RANK} \
                                                           --weight_decay ${WEIGHT_DECAY} \
                                                           --max_num ${MAX_NUM} \
                                                           --grad_clip ${GRAD_CLIP} \
                                                           --num_perturbations ${numPert} \
                                                           --tokenizer char_level \
                                                           --distribution rad \
+                                                          --beta1 ${BETA1} \
+                                                          --beta2 ${BETA2} \
                                                           --solver ${SOLVER} \
+                                                          --sanger_qr_every 100 \
+                                                          --saturating_alpha ${saturating_alpha} \
+                                                          --warmup_iters 1 \
                                                           --seed 42 \
-                                                          --output_dir ./results_${ARCH} \
+                                                          --alpha_eye_scalar ${alpha_eye_scalar} \
+                                                          --beta_eigen_sanger ${beta_eigen_sanger} \
+                                                          --output_dir ./results_15SPSA_1024run \
                                                           ${EXTRA_FLAGS} \
                                                           ;
                                                     echo '[INFO] Finished run: $RUN_NAME_BASE';
                                                     exec bash
                                                     "
                                                     run_counter=$(( run_counter + 1 ))
-                                                    sleep 1
+                                                    # sleep 1
                                                    
                                                     done
                                                 done
                                             done
                                         done
                                     done
+                                done
+                                done
+                                done
+                                done
+                                done
+                                done
+                                done
                                 done
                             done
                         done
