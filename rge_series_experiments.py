@@ -2,6 +2,7 @@
 """
 In series RGE experiments on LSTM and DNC training on a few tasks: overfit, copy, sort, reverse, add, penn treebank, etc. 
 python rge_series_experiments.py --unit_test --max_iterations 10 --micro_batch_size 1 --seq_length 10 --device cuda:1 --solver 1SPSA
+
  choices=["BPTT", "1SPSA", "1.5-SPSA", "2SPSA" ... ] )
 """
 
@@ -571,7 +572,7 @@ def SPSA1_5(model_params: List[torch.Tensor],
         grad_estimate_list.append(grad_estimate / curvature)
         sum_of_losses += (pos_loss + neg_loss) / (2)
 
-        if True:#is_verbose:
+        if is_verbose:
           print(f"  grad_estimate {grad_estimate} curv {curv} denom {curvature} ")
         
         # for param_idx, param in enumerate(model_params):
@@ -682,7 +683,7 @@ def cdrge_optimize(model_params,
                    antithetic=False, 
                    use_adaptive_step=False, 
                    clip_grad_norm=0.0,
-                   cache_gradients = False,
+                   cache_gradients = True,
                    CHUNK_SIZE = 2**15, # TUNE THIS TO MAKE IT FIT IN VRAM BUT ALSO BE FAST
                    args=None):
     """Central Difference Random Gradient Estimation optimization
@@ -741,22 +742,33 @@ def cdrge_optimize(model_params,
     sum_of_losses = 0
 
     
-    if args.beta1>0:                        # Nesterov buffer (m starts at 0)
-        coordinate_momentum   = [torch.zeros_like(p.data) for p in model_params]
+    if args.beta1>0 and not hasattr(args, "coordinate_momentum"):                        # Nesterov buffer (m starts at 0)
+        # coordinate_momentum   = [torch.zeros_like(p.data) for p in model_params]
+        args.coordinate_momentum = [
+                            list(torch.split(torch.zeros_like(p.data, dtype=torch.float32), CHUNK_SIZE, dim=0))
+                            for p in model_params
+                        ]
         
-    if args.beta2>0:                        # RMSProp accumulator (v starts at 1)
-        coordinate_variance = [torch.ones_like(p.data) for p in model_params]
+    if args.beta2>0 and not hasattr(args, "coordinate_variance"):                         # RMSProp accumulator (v starts at 1)
+        # coordinate_variance = [torch.ones_like(p.data) for p in model_params]
+        args.coordinate_variance = [
+                                    list(torch.split(torch.ones_like(p.data, dtype=torch.float32), CHUNK_SIZE, dim=0))
+                                    for p in model_params
+                                ]
 
 
     if args.beta1>0 or args.beta2>0:
-        cache_gradients = True  # you dont need to have this, but it ensures useability for now.. 
-                                # unless you want to implement the non-cache version for momentum or variance
-
+        cache_gradients = True  # theoretically, you dont need to have this, but not implemented otherwise..
+                                # ensures useability for now.. 
+                                # use unless you want to implement the non-cache version to save VRAM
     
     if cache_gradients:
         # one tensor per param to accumulate Σ coeff·probe
-        grad_buffer = [torch.zeros_like(p.data) for p in model_params]
-            # gradients = [torch.zeros_like(p.data) for p in model_params]
+        # grad_buffer = [torch.zeros_like(p.data) for p in model_params]
+        grad_buffer = [
+                            list(torch.split(torch.zeros_like(p.data, dtype=torch.float32), CHUNK_SIZE, dim=0))
+                            for p in model_params
+                        ]
 
         
     else:
@@ -775,13 +787,19 @@ def cdrge_optimize(model_params,
         # Apply positive perturbations using the seed
         ##################################################################
         for param_idx, param in enumerate(model_params):
-            for chunk in torch.split(param.data, CHUNK_SIZE, dim=0):   # 8 k rows each
+            for chunk_idx, chunk in enumerate(torch.split(param.data, CHUNK_SIZE, dim=0)):   # 8 k rows each
+                
                 probe = generate_perturbation(
                     chunk,                
-                    epsilon,
+                    1,
                     distribution,
-                    seed=pert_seed + param_idx
-                )
+                    seed=pert_seed + param_idx + chunk_idx
+                    )
+                if args.beta2>0 and args.use_probe_preconditioning:
+                    # we need to adjust the probe by 1/coordinate_variance but in a safe way..
+                    probe.div_(args.coordinate_variance[param_idx][chunk_idx].sqrt().add_(1e-8))
+                    # probe /= torch.clamp_min(coordinate_variance[param_idx][chunk_idx], 1.0)
+                probe *= epsilon
                 chunk.add_(probe)         # in-place update of that slice only
             
             # Generate and apply perturbation
@@ -802,14 +820,20 @@ def cdrge_optimize(model_params,
         # Apply negative perturbations using the seed
         ##################################################################
         for param_idx, param in enumerate(model_params):
-            for chunk in torch.split(param.data, CHUNK_SIZE, dim=0):   # 8 k rows each
+            for chunk_idx, chunk in enumerate(torch.split(param.data, CHUNK_SIZE, dim=0)):   # 8 k rows each
                 probe = generate_perturbation(
-                    chunk,               
-                     -2*epsilon,
+                    chunk,                
+                    -2,
                     distribution,
-                    seed=pert_seed + param_idx
-                )
+                    seed=pert_seed + param_idx + chunk_idx
+                    )
+                if args.beta2>0 and args.use_probe_preconditioning:
+                    # we need to adjust the probe by 1/coordinate_variance but in a safe way..
+                    probe.div_(args.coordinate_variance[param_idx][chunk_idx].sqrt().add_(1e-8))
+                    # probe /= torch.clamp_min(coordinate_variance[param_idx][chunk_idx], 1.0)
+                probe *= epsilon
                 chunk.add_(probe)         # in-place update of that slice only
+
             # Generate and apply perturbation
             # probe = generate_perturbation(param, -2*epsilon, distribution, seed=pert_seed + param_idx)
             # param.data.add_(probe)
@@ -842,32 +866,31 @@ def cdrge_optimize(model_params,
         #             grad_chunk = grad_buffer[param_idx][chunk]      # same view
         #             grad_chunk.add_(probe, alpha=grad_estimate)
 
+        # return theta to original values for next perturbation or for full updating
         for param_idx, param in enumerate(model_params):
-            rows = param.size(0)
-        
-            for start in range(0, rows, CHUNK_SIZE):
-                end   = min(start + CHUNK_SIZE, rows)
-        
-                slice_param = param.data[start:end]        # view onto weights
+            for chunk_idx, chunk in enumerate(torch.split(param.data, CHUNK_SIZE, dim=0)):
+                
                 probe = generate_perturbation(
-                            slice_param,                   # same shape
+                            chunk,                   # same shape
                             1,
                             distribution,
-                            seed=pert_seed + param_idx
+                            seed=pert_seed + param_idx + chunk_idx
                         )
-        
-                slice_param.add_(probe, alpha=epsilon)     # restore weights
+                
+                if args.beta2>0 and args.use_probe_preconditioning:
+                    # we need to adjust the probe by 1/coordinate_variance but in a safe way..
+                    probe.div_(args.coordinate_variance[param_idx][chunk_idx].sqrt().add_(1e-8))
+                    # probe /= torch.clamp_min(coordinate_variance[param_idx][chunk_idx], 1.0)
+                    
+                     
+                chunk.add_(probe, alpha=epsilon)     # restore weights
         
                 if cache_gradients:
-                    # accumulate coeff·probe into the matching slice of grad_buffer
-                    grad_buffer[param_idx][start:end].add_(probe,
-                                                           alpha=grad_estimate)
-            
-            # # Regenerate the same noise
-            # probe = generate_perturbation(param, epsilon, distribution, seed=pert_seed + param_idx)
-
-            # # Restore parameter by adding the perturbation
-            # param.data.add_(probe)
+                    # conveniently, since we have the chunk probe, 
+                    # mind as well rolling update the weighted average grad vector
+                    # by accumulating the coeff * probe into the matching slice of grad_buffer
+                    grad_buffer[param_idx][chunk_idx].add_(probe, alpha=grad_estimate)
+                    
             
 
     # for idx, param in enumerate(model_params):
@@ -896,35 +919,45 @@ def cdrge_optimize(model_params,
         
         # for buf, param in zip(grad_buffer, model_params):
             # param.data.add_(buf) # buf already stores −∇̂θ / n
-        for i, (g, param) in enumerate(zip(grad_buffer, model_params)):
-
-            # Apply RMSProp and/or momentum 
-            if args.beta1>0:
-                momentum_i = coordinate_momentum[i]
-                momentum_i.mul_(args.beta1).add_(g, alpha=1 - args.beta1)   # m_t
-                m_hat = momentum_i                                
-                # print("----- m_hat:")
-                # print(m_hat[:20])
-            else:
-                m_hat = g
-            
-            if args.beta2>0:
-                variances_i = coordinate_variance[i]
-                variances_i.mul_(args.beta2).addcmul_(g, g, value=1 - args.beta2)  # v_t
-                v_hat = variances_i.sqrt().add_(1e-8)            # ε for numerical stability
-                # print("----- v_hat:")
-                # print(v_hat[:20])
-            else:
-                v_hat = 1.0
+        # for i, (g, param) in enumerate(zip(grad_buffer, model_params)):
+        for param_idx, param in enumerate(model_params):
+            for chunk_idx, chunk in enumerate(torch.split(param.data, CHUNK_SIZE, dim=0)):
                 
-            param.data.add_( lr_to_eta_ratio * m_hat / v_hat )
+                g = grad_buffer[param_idx][chunk_idx]
+    
+                # Apply RMSProp and/or momentum 
+                if args.beta1>0:
+                    momentum_i = args.coordinate_momentum[param_idx][chunk_idx]
+                    momentum_i.mul_(args.beta1).add_(g, alpha=1 - args.beta1)   # m_t
+                    m_hat = momentum_i   
+                    if np.random.rand()>0.99:
+                        print("----- m_hat:")
+                        print(m_hat[:20])
+                else:
+                    m_hat = g
+                
+                if args.beta2>0:
+                    variances_i = args.coordinate_variance[param_idx][chunk_idx]
+                    variances_i.mul_(args.beta2).addcmul_(g, g, value=1 - args.beta2)  # v_t
+                    v_hat = variances_i.sqrt().add_(1e-8)            # ε for numerical stability
+                    if np.random.rand()>0.99:
+                        print("----- v_hat:")
+                        print(v_hat[:20])
+                else:
+                    v_hat = 1.0# Parameter update
 
-            # ---- Decoupled weight decay (AdamW style) --------------------
-            if hasattr(args, "weight_decay") and args.weight_decay > 0.0:
-                # Skip 1-D tensors (biases, LayerNorm/BatchNorm weights)
-                if param.ndim > 1:
-                    param.data.add_(param.data, alpha = -lr * args.weight_decay)
 
+                if args.use_probe_preconditioning:
+                    chunk.data.add_( lr_to_eta_ratio * m_hat ) #  v_hat is already in the chunk.
+                else:
+                    chunk.data.add_( lr_to_eta_ratio * m_hat / v_hat )
+    
+                # ---- Decoupled weight decay (AdamW style) --------------------
+                if args.weight_decay > 0.0:
+                    # Skip 1-D tensors (biases, LayerNorm/BatchNorm weights)
+                    if param.ndim > 1:
+                        chunk.add_(chunk, alpha = -lr * args.weight_decay)
+    
 
     
 
@@ -958,7 +991,6 @@ def cdrge_optimize(model_params,
     if is_verbose:
         print(f"CD-RGE: Optimization completed in {elapsed:.2f}s with loss {loss:.6f}")
     return metrics
-
 
 
 def cdrge_no_chunking(model_params, loss_fn, lr, epsilon, iterations, num_perturbations=20,
@@ -1507,6 +1539,842 @@ def SPSA2(model_params: List[torch.Tensor],
 
 
 
+import pdb
+from collections import deque
+
+def BanditSPSA(model_params,
+               loss_fn,
+               lr,
+               epsilon,
+               iterations,                  # <-- ignored; keep for API parity
+               num_perturbations=20,
+               distribution='rad',
+               antithetic=False,
+               use_adaptive_step=False,
+               clip_grad_norm=0.0,
+               cache_gradients=True,
+               CHUNK_SIZE=2**15,
+               args=None):
+    """
+    Bandit-SPSA step (one optimiser update).
+    Keeps the exact public interface of SPSA1.
+    """
+
+    print("BanditSPSA")
+    # ────────────────────────────────────────────────────────────────────
+    # 0.  persistent state (reservoir & step counter)                    │
+    # ────────────────────────────────────────────────────────────────────
+    if not hasattr(BanditSPSA, "_state"):
+        BanditSPSA._state = {"step": 0,
+                             "reservoir": {}  # seed ▸ {'ema':float,'pulls':int,'grads':deque}
+                            }
+    st: Dict = BanditSPSA._state
+    step        = st["step"]
+    reservoir   = st["reservoir"]            # type: Dict[int, Dict]
+
+    # print("="*50)
+    # print("Before")
+    # print("="*50)
+    # print(st)
+    # print("="*50)
+    
+    # Hard reset every 1000 updates
+    if step and step % 1000 == 0:
+        reservoir.clear()
+
+    # exploitation share pt(t) : 0.2 → 0.9 (logistic in first 500 steps)
+    def pt_sched(t: int) -> float:
+        return 0.20 + 0.70 / (1.0 + math.exp(-(t - 250) / 75.0))
+    pt = pt_sched(step)
+
+    # ────────────────────────────────────────────────────────────────────
+    # 1.  choose seeds: exploit (reservoir) + explore (new)              │
+    # ────────────────────────────────────────────────────────────────────
+    n_exploit = min(int(round(num_perturbations * pt)), len(reservoir))
+    n_explore = num_perturbations - n_exploit
+
+    exploit_seeds, exploit_probs = [], []     # sampling probs inside reservoir
+    if n_exploit:
+        # UCB-Boltzmann scores
+        total_pulls = sum(r['pulls'] for r in reservoir.values()) or 1
+        seeds   = list(reservoir.keys())
+        # scores  = [abs(r['ema']) +
+        #            math.sqrt(math.log(total_pulls + 1.0) /
+        #                      (r['pulls'] + 1e-9))
+        #            for r in reservoir.values()]
+        scores  = [abs(r['ema'])  for r in reservoir.values()] # NO UCB method
+
+        m       = max(scores)
+        softmax = [math.exp( (s - m)/args.bandit_softmax_temperature) for s in scores]
+        Z       = sum(softmax)
+        probs   = [s/Z for s in softmax]
+
+        # sample WITHOUT replacement until n_exploit collected
+        # (retry if duplicates happen due to replacement-by-default)
+        while len(exploit_seeds) < n_exploit and seeds:
+            choice = random.choices(seeds, weights=probs, k=1)[0]
+            idx    = seeds.index(choice)
+            exploit_seeds.append(choice)
+            exploit_probs.append(probs[idx])
+            seeds.pop(idx); probs.pop(idx)
+
+    # ───────── VERBOSE BLOCK ────────────────────────────
+    if True:
+        print(f"Reservoir size {len(reservoir.items())}")
+        # 1) Top-10 probes in the reservoir by |EMA|
+        if reservoir:
+            print("\n── Top-10 reservoir EMAs ──")
+            for rank, (s, r) in enumerate(
+                    sorted(reservoir.items(),
+                           key=lambda kv: -abs(kv[1]['ema']))[:10], 1):
+                print(f"{rank:2d}. seed={s:>10}  ema={r['ema']:+.3e}  "
+                      f"pulls={r['pulls']:4d}  last_grad={r['grads'][-1][1]:+.2e}")
+        else:
+            print("\n[reservoir is empty]")
+    
+        # 2) UCB scores for the seeds we just chose to exploit
+        if exploit_seeds:
+            print("\n── Exploit selection this step ──")
+            for s, p in zip(exploit_seeds, exploit_probs):
+                r     = reservoir[s]
+                # score = abs(r['ema']) + math.sqrt(
+                #             math.log(sum(rr['pulls'] for rr in reservoir.values())+1)
+                #             /(r['pulls']+1e-9))
+                score = abs(r['ema']) # NO UCB
+                print(f"seed={s:>10}  UCB={score:+.3e}  "
+                      f"ema={r['ema']:+.3e}  pulls={r['pulls']:4d}  "
+                      f"prob={p:.3f}")
+        print("────────────────────────────────────\n")
+        # pdb.set_trace()
+    # ───────────────── END VERBOSE BLOCK ────────────────────────────────
+    
+
+    
+    # exploration seeds (unique & not in reservoir)
+    explore_seeds = []
+    while len(explore_seeds) < n_explore:
+        s = random.randint(0, 2**32 - 1)
+        if s not in reservoir and s not in exploit_seeds:
+            explore_seeds.append(s)
+
+    # concat lists for main loop
+    all_seeds  = exploit_seeds + explore_seeds
+    all_probs  = exploit_probs + [None] * n_explore   # None ⇒ explore
+
+    # per-seed importance weight  w = 1 / (num_perturbations * P(s))
+    #   • exploit:   P(s) = pt * p_i
+    #   • explore:   P(s) = (1-pt) / n_explore  (≈ uniform over chosen newcomers)
+    weights = []
+    for p in all_probs:
+        if p is None:  # explore
+            if n_explore == 0 or (1-pt) < 1e-12:
+                weights.append(1.0)           # degenerate but safe
+            else:
+                weights.append(1.0)
+                # weights.append(1.0 / (num_perturbations * (1-pt) / n_explore))
+        else:           # exploit
+            weights.append(1.0)
+            # weights.append(1.0 / (num_perturbations * pt * p))
+
+    # ────────────────────────────────────────────────────────────────────
+    # 2.  boiler-plate from SPSA1  (buffers, momentum, variance)         │
+    # ────────────────────────────────────────────────────────────────────
+    is_verbose = bool(args and getattr(args, "verbose", False))
+    lr_eta     = lr / epsilon
+    macro_bs   = getattr(args, "macro_batch_size", 1)
+    start_t    = time.time()
+
+    if getattr(args, "beta1", 0.0) > 0:
+        coord_mom = [list(torch.split(torch.zeros_like(p.data), CHUNK_SIZE, dim=0))
+                     for p in model_params]
+    if getattr(args, "beta2", 0.0) > 0:
+        coord_var = [list(torch.split(torch.ones_like(p.data), CHUNK_SIZE, dim=0))
+                     for p in model_params]
+    if (getattr(args, "beta1", 0.0) > 0 or getattr(args, "beta2", 0.0) > 0):
+        cache_gradients = True
+    if cache_gradients:
+        grad_buf = [list(torch.split(torch.zeros_like(p.data), CHUNK_SIZE, dim=0))
+                    for p in model_params]
+    else:
+        raise RuntimeError("BanditSPSA requires cache_gradients=True")
+
+    sum_loss = 0.0
+
+    # ────────────────────────────────────────────────────────────────────
+    # 3.  loop over probes                                              │
+    # ────────────────────────────────────────────────────────────────────
+    for seed, w in zip(all_seeds, weights):
+        # local torch.Generator to avoid clobbering global RNG
+        # ----------------------------------------------------
+        def gen_probe(chunk, scale):
+            g = torch.Generator(device=chunk.device); g.manual_seed(seed + scale)
+            return generate_perturbation(chunk, scale, distribution, seed + scale)
+
+        # +ε
+        for p_idx, p in enumerate(model_params):
+            for c_idx, ch in enumerate(torch.split(p.data, CHUNK_SIZE, dim=0)):
+                probe = generate_perturbation(
+                    ch, 1, distribution, seed + p_idx + c_idx)
+                if getattr(args, "beta2", 0.0) and args.use_probe_preconditioning:
+                    probe /= torch.clamp_min(coord_var[p_idx][c_idx], 1.0)
+                ch.add_(probe, alpha=epsilon)
+
+        pos = sum(float(loss_fn().item() if hasattr(loss_fn(), "item") else loss_fn())
+                  for _ in range(macro_bs)) / macro_bs
+
+        # –ε  (add −2ε probe)
+        for p_idx, p in enumerate(model_params):
+            for c_idx, ch in enumerate(torch.split(p.data, CHUNK_SIZE, dim=0)):
+                probe = generate_perturbation(
+                    ch, -2, distribution, seed + p_idx + c_idx)
+                if getattr(args, "beta2", 0.0) and args.use_probe_preconditioning:
+                    probe /= torch.clamp_min(coord_var[p_idx][c_idx], 1.0)
+                ch.add_(probe, alpha=epsilon)
+
+        neg = sum(float(loss_fn().item() if hasattr(loss_fn(), "item") else loss_fn())
+                  for _ in range(macro_bs)) / macro_bs
+
+        raw_fd   = -(pos - neg) / 2.0                     # finite diff
+        coeff    = raw_fd * w                             # IS-weighted coeff
+        sum_loss += (pos + neg) / 2.0
+
+        # restore params & accumulate gradient
+        for p_idx, p in enumerate(model_params):
+            for c_idx, ch in enumerate(torch.split(p.data, CHUNK_SIZE, dim=0)):
+                probe = generate_perturbation(
+                    ch, 1, distribution, seed + p_idx + c_idx)
+                if getattr(args, "beta2", 0.0) and args.use_probe_preconditioning:
+                    probe /= torch.clamp_min(coord_var[p_idx][c_idx], 1.0)
+                ch.add_(probe, alpha=epsilon)             # back to θ
+                grad_buf[p_idx][c_idx].add_(probe, alpha=coeff)
+
+        # ─ update / insert into reservoir ────────────────────────────
+        if abs(raw_fd) > 1e-3:
+            rec = reservoir.get(seed)
+            if rec is None:
+                reservoir[seed] = {'ema': raw_fd,
+                                   'pulls': 1,
+                                   'grads': deque([(step, raw_fd)], maxlen=20)}
+            else:
+                rec['pulls'] += 1
+                rec['ema']  = 0.5 * rec['ema'] + 0.5 * raw_fd
+                rec['grads'].append((step, raw_fd))
+
+            # prune if >10 k
+            if len(reservoir) > 10_000:
+                for s, _ in sorted(reservoir.items(),
+                                   key=lambda kv: abs(kv[1]['ema']))[:len(reservoir)-10_000]:
+                    reservoir.pop(s, None)
+
+    # ────────────────────────────────────────────────────────────────────
+    # 4.  parameter update                                              │
+    # ────────────────────────────────────────────────────────────────────
+    for p_idx, p in enumerate(model_params):
+        for c_idx, ch in enumerate(torch.split(p.data, CHUNK_SIZE, dim=0)):
+            g = grad_buf[p_idx][c_idx]
+
+            if getattr(args, "beta1", 0.0) > 0:
+                m = coord_mom[p_idx][c_idx]
+                m.mul_(args.beta1).add_(g, alpha=1 - args.beta1)
+                m_hat = m
+            else:
+                m_hat = g
+
+            if getattr(args, "beta2", 0.0) > 0:
+                v = coord_var[p_idx][c_idx]
+                v.mul_(args.beta2).addcmul_(g, g, value=1 - args.beta2)
+                v_hat = v.sqrt().add_(1e-8)
+            else:
+                v_hat = 1.0
+
+            ch.add_(lr_eta * m_hat / v_hat)
+
+            if getattr(args, "weight_decay", 0.0) > 0.0 and p.ndim > 1:
+                ch.add_(ch, alpha=-lr * args.weight_decay)
+
+    # ────────────────────────────────────────────────────────────────────
+    # 5.  bookkeeping                                                   │
+    # ────────────────────────────────────────────────────────────────────
+    if is_verbose:
+        el  = time.time() - start_t
+        print(f"[BanditSPSA] step={step}  pt={pt:.3f}  "
+              f"loss={sum_loss/num_perturbations:.6f}  "
+              f"reservoir={len(reservoir)}  Δt={el:.2f}s")
+
+    st["step"] += 1
+
+    return {
+        "iterations": [step],
+        "train_loss": [sum_loss / num_perturbations],
+        "elapsed_time": [time.time() - start_t],
+        "grad_norm": []
+    }
+
+
+# def SangerSPSA(model_params,
+#            loss_fn,
+#            lr,
+#            epsilon,
+#            iterations,                    # kept for API parity (unused)
+#            num_perturbations=20,
+#            distribution='rad',
+#            antithetic=False,
+#            use_adaptive_step=False,
+#            clip_grad_norm=0.0,
+#            cache_gradients=True,
+#            CHUNK_SIZE=2**15,
+#            args=None):
+#     """
+#     One optimisation step of Sub-space Pre-conditioned SPSA (Sanger-SPSA).
+#     Interface and coding patterns follow SPSA1 exactly.
+#     """
+
+#     # ────────────────────────────────────────────────────────────────────
+#     # 0.  persistent state for the sub-space                            │
+#     # ────────────────────────────────────────────────────────────────────
+#     rank = args.sanger_rank  
+#     warmup_iters = args.warmup_iters
+#     base_lr = 1e-4
+    
+#     # WARMUP THE LR SO YOU GIVE THE SUBSPACE A CHANCE TO LEARN ANYTHING
+#     # update lr warmup factor
+#     warmup_factor = min(iterations / float(warmup_iters), 1.0)
+    
+#     # update LR for this step
+#     learning_rate = base_lr + args.learning_rate * warmup_factor
+    
+#     beta_eigen_sanger = base_lr + args.beta_eigen_sanger - args.beta_eigen_sanger * warmup_factor
+    
+#     dim       = sum(p.numel() for p in model_params)
+#     device    = model_params[0].device
+#     dtype     = model_params[0].dtype
+    
+#     if not hasattr(args, "_state"):
+#         print("initializing Sanger V")
+#         V = torch.empty(dim, rank, device=device, dtype=torch.float32).normal_()
+#         V, _ = torch.linalg.qr(V, mode="reduced")          # orthonormal fp32 columns
+    
+#         args._state = {
+#             "step": 0,
+#             "V"  : V,                                      # (d × n)  fp32
+#             "lam": torch.ones(rank, device=device, dtype=torch.float32)
+#         }
+#         print("done initializing Sanger V")
+
+
+#     st   = args._state
+#     V    = st["V"]                                       # (d × n)
+#     lam  = st["lam"]                                     # (n,)
+#     step = st["step"]
+
+#     # ────────────────────────────────────────────────────────────────────
+#     # 1.  build SPSA gradient estimate  (identical to SPSA1 core)       │
+#     # ────────────────────────────────────────────────────────────────────
+#     lr_eta     = learning_rate / epsilon
+#     macro_bs   = getattr(args, "macro_batch_size", 1)
+#     is_verbose = bool(args and getattr(args, "verbose", False))
+#     start_t    = time.time()
+
+#     if getattr(args, "beta1", 0.0) > 0:
+#         coord_mom = [list(torch.split(torch.zeros_like(p.data), CHUNK_SIZE, dim=0))
+#                      for p in model_params]
+#     if getattr(args, "beta2", 0.0) > 0:
+#         coord_var = [list(torch.split(torch.ones_like(p.data), CHUNK_SIZE, dim=0))
+#                      for p in model_params]
+#     if (getattr(args, "beta1", 0.0) > 0 or getattr(args, "beta2", 0.0) > 0):
+#         cache_gradients = True
+#     if cache_gradients:
+#         grad_buf = [list(torch.split(torch.zeros_like(p.data), CHUNK_SIZE, dim=0))
+#                     for p in model_params]
+#     else:
+#         raise RuntimeError("SangerSPSA requires cache_gradients=True")
+
+#     sum_loss = 0.0
+#     all_seeds: List[int] = [random.randint(0, 2**32 - 1) for _ in range(num_perturbations)]
+
+#     for seed in all_seeds:
+#         # +ε
+#         for p_idx, p in enumerate(model_params):
+#             for c_idx, ch in enumerate(torch.split(p.data, CHUNK_SIZE, dim=0)):
+#                 probe = generate_perturbation(
+#                     ch, 1, distribution, seed + p_idx + c_idx)
+#                 if getattr(args, "beta2", 0.0) and args.use_probe_preconditioning:
+#                     probe /= torch.clamp_min(coord_var[p_idx][c_idx], 1.0)
+#                 ch.add_(probe, alpha=epsilon)
+
+#         pos = sum(float(loss_fn().item() if hasattr(loss_fn(), "item") else loss_fn())
+#                   for _ in range(macro_bs)) / macro_bs
+
+#         # –ε
+#         for p_idx, p in enumerate(model_params):
+#             for c_idx, ch in enumerate(torch.split(p.data, CHUNK_SIZE, dim=0)):
+#                 probe = generate_perturbation(
+#                     ch, -2, distribution, seed + p_idx + c_idx)
+#                 if getattr(args, "beta2", 0.0) and args.use_probe_preconditioning:
+#                     probe /= torch.clamp_min(coord_var[p_idx][c_idx], 1.0)
+#                 ch.add_(probe, alpha=epsilon)
+
+#         neg = sum(float(loss_fn().item() if hasattr(loss_fn(), "item") else loss_fn())
+#                   for _ in range(macro_bs)) / macro_bs
+
+#         fd_coeff = -(pos - neg) / (2 * num_perturbations)   # 1-sided scaling handled here
+#         sum_loss += (pos + neg) / 2.0
+
+#         # restore θ and accumulate gradient
+#         for p_idx, p in enumerate(model_params):
+#             for c_idx, ch in enumerate(torch.split(p.data, CHUNK_SIZE, dim=0)):
+#                 probe = generate_perturbation(
+#                     ch, 1, distribution, seed + p_idx + c_idx)
+#                 if getattr(args, "beta2", 0.0) and args.use_probe_preconditioning:
+#                     probe /= torch.clamp_min(coord_var[p_idx][c_idx], 1.0)
+#                 ch.add_(probe, alpha=epsilon)
+#                 grad_buf[p_idx][c_idx].add_(probe, alpha=fd_coeff)
+
+#     # flatten accumulated gradient  g  (d-vector, fp32 for maths)
+#     g_flat = torch.cat(
+#         [torch.cat([c.reshape(-1) for c in chunks]) for chunks in grad_buf]
+#     ).to(dtype=torch.float32)
+
+#     # ────────────────────────────────────────────────────────────────────
+#     # 2.  Sanger-SPSA pre-conditioning                                       │
+#     #     P g = (I-VVᵀ)g  +  V Λ⁻¹ Vᵀ g                                   │
+#     # ────────────────────────────────────────────────────────────────────
+#     g_proj      = V.T @ g_flat                       # (n,)
+#     pre_g_flat = V @ (g_proj / lam)                 # whitened/parallel part
+#     # pre_g_flat  += g_flat - V @ g_proj                # orthogonal part (noise?)
+    
+#     # distribute pre_g_flat back into param-shaped chunks & update θ
+#     offset = 0
+#     for p_idx, p in enumerate(model_params):
+#         for c_idx, ch in enumerate(torch.split(p.data, CHUNK_SIZE, dim=0)):
+#             numel = ch.numel()
+#             g_chunk = pre_g_flat[offset:offset+numel].view_as(ch)
+#             offset += numel
+
+#             # momentum / RMSProp
+#             if getattr(args, "beta1", 0.0) > 0:
+#                 m = coord_mom[p_idx][c_idx]
+#                 m.mul_(args.beta1).add_(g_chunk, alpha=1 - args.beta1)
+#                 m_hat = m
+#             else:
+#                 m_hat = g_chunk
+
+#             if getattr(args, "beta2", 0.0) > 0:
+#                 v = coord_var[p_idx][c_idx]
+#                 v.mul_(args.beta2).addcmul_(g_chunk, g_chunk, value=1 - args.beta2)
+#                 v_hat = v.sqrt().add_(1e-8)
+#             else:
+#                 v_hat = 1.0
+
+#             ch.add_(lr_eta * m_hat / v_hat)          # Robbins–Monro step
+#             if getattr(args, "weight_decay", 0.0) > 0.0 and p.ndim > 1:
+#                 ch.add_(ch, alpha=-lr * args.weight_decay)
+
+#     # ────────────────────────────────────────────────────────────────────
+#     # 3.  Sanger/Oja update of sub-space                                 │
+#     # ────────────────────────────────────────────────────────────────────
+#     # print("updating Sanger values")
+#     with torch.no_grad():
+#         # g_flat = g_flat / (g_flat.norm() + 1e-12)    # optional normalisation
+#         g_proj = V.T @ g_flat                        # (n,)
+#         # Sanger rule
+#         V += beta_eigen_sanger * (g_flat.view(-1, 1) @ g_proj.view(1, -1)
+#                     - V @ torch.triu(g_proj.view(-1, 1) @ g_proj.view(1, -1)))
+#         # renormalise columns periodically
+#         if (step + 1) % args.sanger_qr_every == 0:
+#             V, _ = torch.linalg.qr(V, mode="reduced")        # orthonormal columns
+#             # V = torch.nn.functional.normalize(V, dim=0)   # each column ‖v‖₂ = 1
+
+
+#         # eigen-value EWMA
+#         lam.mul_(1 - beta_eigen_sanger).add_(g_proj.pow(2), alpha=beta_eigen_sanger).clamp_(min=1e-8)
+#         if np.random.rand()>0.99:
+#             print("--lambdas:")
+#             print(lam)
+#         explained_var = g_proj.pow(2).sum() / g_flat.pow(2).sum()
+#         print(f"Subspace captures {explained_var:.5%} of gradient variance")
+
+
+#     # stash back
+#     st["V"], st["lam"], st["step"] = V, lam, step + 1
+
+
+#     # print("done updating Sanger values")
+#     # ────────────────────────────────────────────────────────────────────
+#     # 4.  bookkeeping                                                   │
+#     # ────────────────────────────────────────────────────────────────────
+#     if is_verbose:
+#         dt = time.time() - start_t
+#         print(f"[SangerSPSA] step={step:4d}  loss={sum_loss/num_perturbations:.6f} "
+#               f"|V|={rank}  minλ={lam.min():.3e}  max|g_proj|={g_proj.abs().max():.3e}  Δt={dt:.2f}s")
+
+#     return {
+#         "iterations": [step],
+#         "train_loss": [sum_loss / num_perturbations],
+#         "elapsed_time": [time.time() - start_t],
+#         "grad_norm": []    # (optional: compute if you need it)
+#     }
+
+
+
+
+
+
+# second try. got 1 working thats all.. 
+# def SangerSPSA(model_params,
+#            loss_fn,
+#            lr,
+#            epsilon,
+#            iterations,                    # kept for API parity (unused)
+#            num_perturbations=20,
+#            distribution='rad',
+#            antithetic=False,
+#            use_adaptive_step=False,
+#            clip_grad_norm=0.0,
+#            cache_gradients=True,
+#            CHUNK_SIZE=2**15,              # kept for API parity (ignored now)
+#            args=None):
+#     """
+#     One optimisation step of Sub-space Pre-conditioned SPSA (Sanger-SPSA).
+
+#     Differences vs. earlier version:
+#         • No chunking / per-parameter loops – operate on the full flattened vector.
+#         • Probe whitening:  probe ← V Λ⁻¹ Vᵀ probe  when args.use_probe_preconditioning.
+#         • coord_mom / coord_var removed entirely.
+#     """
+
+#     # ─────────────────────────────────────────────────────────────────
+#     # 0.  persistent state for the sub-space
+#     # ─────────────────────────────────────────────────────────────────
+#     rank          = args.sanger_rank
+#     warmup_iters  = args.warmup_iters
+#     base_lr       = 1e-4
+
+#     warmup_factor = min(iterations / float(warmup_iters), 1.0)
+#     learning_rate = base_lr + args.learning_rate * warmup_factor
+#     beta_eigen_sanger = base_lr + args.beta_eigen_sanger - args.beta_eigen_sanger * warmup_factor
+
+#     full_vec   = torch.nn.utils.parameters_to_vector(model_params).detach()
+#     dim        = full_vec.numel()
+#     device     = full_vec.device
+
+#     if not hasattr(args, "_state"):
+#         V = torch.randn(dim, rank, device=device, dtype=torch.float32)
+#         V, _ = torch.linalg.qr(V, mode="reduced")       # orthonormal columns
+#         args._state = dict(step=0,
+#                            V=V,
+#                            lam=torch.ones(rank, device=device, dtype=torch.float32))
+
+#     st   = args._state
+#     V    = st["V"]
+#     lam  = st["lam"]
+#     step = st["step"]
+
+#     def precond(vec_f32):
+#         proj = V.T @ vec_f32
+#         return V @ (proj / (lam) )
+
+#     lr_eta   = learning_rate / epsilon
+#     macro_bs = getattr(args, "macro_batch_size", 1)
+#     is_verbose = bool(args and getattr(args, "verbose", False))
+#     start_t  = time.time()
+
+#     grad_acc = torch.zeros_like(full_vec, dtype=torch.float32)
+
+#     # ─────────────────────────────────────────────────────────────────
+#     # 1.  build SPSA gradient estimate
+#     # ─────────────────────────────────────────────────────────────────
+#     seeds = [random.randint(0, 2**32 - 1) for _ in range(num_perturbations)]
+
+#     for sd in seeds:
+#         # +ε
+#         probe = generate_perturbation(full_vec, 1, distribution, sd).to(torch.float32)
+#         if args.use_probe_preconditioning:
+#             probe = precond(probe)
+#         full_vec.add_(probe, alpha=epsilon)
+#         torch.nn.utils.vector_to_parameters(full_vec, model_params)
+
+#         pos = sum(float(loss_fn()) for _ in range(macro_bs)) / macro_bs
+
+#         # –ε
+#         full_vec.add_(probe, alpha=-2 * epsilon)
+#         torch.nn.utils.vector_to_parameters(full_vec, model_params)
+
+#         neg = sum(float(loss_fn()) for _ in range(macro_bs)) / macro_bs
+
+#         fd_coeff = -(pos - neg) / (2 * num_perturbations)
+#         grad_acc.add_(probe, alpha=fd_coeff)
+
+#         # restore θ
+#         full_vec.add_(probe, alpha=epsilon)
+
+#     torch.nn.utils.vector_to_parameters(full_vec, model_params)  # ensure params restored
+#     g_flat = grad_acc
+
+#     # ─────────────────────────────────────────────────────────────────
+#     # 2.  low-rank Newton pre-conditioning:  Pg = V Λ⁻¹ Vᵀ g
+#     # ─────────────────────────────────────────────────────────────────
+#     pre_g = precond(g_flat)
+
+#     full_vec.add_(pre_g, alpha=lr_eta)
+#     torch.nn.utils.vector_to_parameters(full_vec, model_params)
+
+#     # ─────────────────────────────────────────────────────────────────
+#     # 3.  Sanger / Oja update of sub-space
+#     # ─────────────────────────────────────────────────────────────────
+#     with torch.no_grad():
+#         g_proj = V.T @ g_flat
+#         V += beta_eigen_sanger * (
+#                  g_flat.unsqueeze(1) @ g_proj.unsqueeze(0)
+#                - V @ torch.triu(g_proj.unsqueeze(1) @ g_proj.unsqueeze(0))
+#         )
+#         if (step + 1) % args.sanger_qr_every == 0:
+#             V, _ = torch.linalg.qr(V, mode="reduced")
+
+#         # lam.mul_(1 - beta_eigen_sanger).add_(g_proj.pow(2),
+#         #                                      alpha=beta_eigen_sanger).clamp_(min=1e-8)
+
+#         explained = (g_proj.pow(2).sum() / g_flat.pow(2).sum()).item()
+#         print(f"Subspace captures {explained:.5%} of gradient variance")
+
+#     st["V"], st["lam"], st["step"] = V, lam, step + 1
+
+#     # ─────────────────────────────────────────────────────────────────
+#     # 4.  bookkeeping
+#     # ─────────────────────────────────────────────────────────────────
+#     if is_verbose:
+#         dt = time.time() - start_t
+#         print(f"[SangerSPSA] step={step:4d} "
+#               f"loss={(pos+neg)/2.0:.6f} |V|={rank} "
+#               f"minλ={lam.min():.3e} max|g_proj|={g_proj.abs().max():.3e} "
+#               f"Δt={dt:.2f}s")
+
+#     return dict(iterations=[step],
+#                 train_loss=[(pos + neg) / 2.0],
+#                 elapsed_time=[time.time() - start_t],
+#                 grad_norm=[])
+
+
+
+def SangerSPSA(model_params,
+               loss_fn,
+               lr,
+               epsilon,
+               iterations,                    # kept for API parity
+               num_perturbations=20,
+               distribution="rad",
+               antithetic=False,
+               use_adaptive_step=False,
+               clip_grad_norm=0.0,
+               cache_gradients=True,
+               CHUNK_SIZE=2**15,              # ignored
+               args=None):
+    """
+    Sub-space Pre-conditioned SPSA with a single matrix W (P = W Wᵀ + αI).
+    Memory-efficient column-wise W-update; no explicit d×n outer product.
+    """
+    import time, random, math
+    import torch
+    from torch.nn.utils import parameters_to_vector, vector_to_parameters
+
+    # ───── 0. hyper-params & persistent state ─────
+    rank         = args.sanger_rank
+    base_lr      = 1e-4
+    warmup_iters = args.warmup_iters
+    alpha_eye_scalar  = args.alpha_eye_scalar
+    β_eig_base   = args.beta_eigen_sanger
+
+    warm     = min(float(iterations) / float(max(1, warmup_iters)), 1.0)
+    lr_sched = base_lr + args.learning_rate * warm
+    β_eig    = β_eig_base #base_lr + β_eig_base - β_eig_base * warm
+
+    model_params_flat = parameters_to_vector(model_params).detach().to(torch.float32)
+    d, dev = model_params_flat.numel(), model_params_flat.device
+
+    if not hasattr(args, "_state"):
+        # init W; keep your original QR init when possible
+        W = torch.randn(d, rank, device=dev, dtype=torch.float32)
+        try:
+            W, _ = torch.linalg.qr(W, mode="reduced")
+        except RuntimeError:
+            # if QR is too big, just column-normalize
+            W /= W.norm(dim=0, keepdim=True).clamp_min(1e-6)
+        args._state = dict(step=0, W=W)
+
+    st, W, step = args._state, args._state["W"], args._state["step"]
+
+    # projector
+    def P(vec):
+        return W @ (W.T @ vec)
+
+    # keep a sane base step (no rank/epsilon amplification)
+    lr_eta   = lr_sched
+    macro_bs = getattr(args, "macro_batch_size", 1)
+    verbose  = bool(args and getattr(args, "verbose", False))
+    start_t  = time.time()
+
+    # ───── Baseline loss at θ (for safety/backtracking) ─────
+    vector_to_parameters(model_params_flat, model_params)
+    base_loss = 0.0
+    finite0 = True
+    for _ in range(macro_bs):
+        lv = float(loss_fn())
+        if not math.isfinite(lv):
+            finite0 = False
+            break
+        base_loss += lv
+    base_loss = base_loss / macro_bs if finite0 else float("inf")
+
+    # ───── 1. SPSA gradient estimate ─────
+    g_flat = torch.zeros_like(model_params_flat, dtype=torch.float32)
+    seeds    = [random.randint(0, 2**32 - 1) for _ in range(num_perturbations)]
+    safe_eps = max(1e-8, float(abs(epsilon)))
+
+    for sd in seeds:
+        # IMPORTANT: keep true Rademacher scale (±1 per coordinate)
+        probe = generate_perturbation(model_params_flat, 1, distribution, sd).to(torch.float32)
+
+        if hasattr(args, "use_probe_preconditioning") and args.use_probe_preconditioning:
+            # project into subspace then rescale to match ||rad|| ≈ √d
+            probe = P(probe)
+            pn = probe.norm()
+            if torch.isfinite(pn) and pn > 0:
+                probe.mul_(math.sqrt(float(d)) / (pn + 1e-12))
+
+        # +ε
+        with torch.no_grad():
+            model_params_flat.add_(probe, alpha=safe_eps)
+            vector_to_parameters(model_params_flat, model_params)
+        pos, finite = 0.0, True
+        for _ in range(macro_bs):
+            lv = float(loss_fn())
+            if not math.isfinite(lv):
+                finite = False
+                break
+            pos += lv
+        pos = pos / macro_bs if finite else float("nan")
+
+        # –ε
+        with torch.no_grad():
+            model_params_flat.add_(probe, alpha=-2.0 * safe_eps)
+            vector_to_parameters(model_params_flat, model_params)
+        neg = 0.0
+        if finite:
+            for _ in range(macro_bs):
+                lv = float(loss_fn())
+                if not math.isfinite(lv):
+                    finite = False
+                    break
+                neg += lv
+            neg = neg / macro_bs if finite else float("nan")
+
+        # restore θ
+        with torch.no_grad():
+            model_params_flat.add_(probe, alpha=safe_eps)
+            vector_to_parameters(model_params_flat, model_params)
+
+        if not finite:
+            continue
+
+        # keep your sign: g_flat will approximate -∇f
+        coeff = -(pos - neg) / (2.0 * num_perturbations * safe_eps)
+        g_flat.add_(probe, alpha=coeff)
+
+    g_norm = g_flat.norm()
+
+    # optional clip
+    # if clip_grad_norm and clip_grad_norm > 0.0:
+    #     if torch.isfinite(g_norm) and g_norm > clip_grad_norm:
+    #         g_flat.mul_(clip_grad_norm / (g_norm + 1e-12))
+    #         g_norm = g_flat.norm()
+
+    # ───── 2. pre-condition & update θ ─────
+    pre_g  = P(g_flat) + alpha_eye_scalar * g_flat  
+
+    # Scale update so L2(Δθ) ≈ ε·√d (≈ ε per parameter on average)
+    update = pre_g * lr_eta
+    # upn = update.norm()
+    # target_norm = safe_eps * math.sqrt(float(d))
+    # if torch.isfinite(upn) and upn > 0:
+    #     update.mul_(target_norm / (upn + 1e-12))
+
+    # Safety backtracking only if loss explodes; otherwise accept to avoid freezing
+    # accepted = False
+    # for _try in range(6):
+    with torch.no_grad():
+        model_params_flat.add_(update)
+        vector_to_parameters(model_params_flat, model_params)
+
+    #     new_loss, finite = 0.0, True
+    #     for _ in range(macro_bs):
+    #         lv = float(loss_fn())
+    #         if not math.isfinite(lv):
+    #             finite = False
+    #             break
+    #         new_loss += lv
+    #     new_loss = new_loss / macro_bs if finite else float("inf")
+
+    #     # If non-finite or catastrophically worse, backtrack; else accept
+    #     if (not finite) or (new_loss > base_loss * 5.0):
+    #         with torch.no_grad():
+    #             model_params_flat.sub_(update)
+    #             vector_to_parameters(model_params_flat, model_params)
+    #         update.mul_(0.25)
+    #     else:
+    #         accepted = True
+    #         base_loss = min(base_loss, new_loss)
+    #         break
+
+    # if not accepted:
+    #     # last-ditch tiny step in the descent direction to keep moving
+    #     tiny = (pre_g / pre_g.norm().clamp_min(1e-12)) * (safe_eps / math.sqrt(float(d)))
+    #     with torch.no_grad():
+    #         model_params_flat.add_(tiny)
+    #         vector_to_parameters(model_params_flat, model_params)
+
+    # ───── 3. memory-light W update (column-wise) ─────
+    with torch.no_grad():
+        g_unit = g_flat / g_norm.clamp_min(1e-12)
+        proj   = W.T @ g_unit
+        acc    = torch.zeros_like(g_unit)
+
+        for i in range(rank):
+            acc.add_(W[:, i], alpha=proj[i])    # Σ_{j≤i} proj_j W_j
+            delta = (g_unit - acc) * proj[i]
+            W[:, i].add_(delta, alpha=β_eig)
+
+            # keep each column well-scaled
+            cn = W[:, i].norm()
+            if torch.isfinite(cn) and cn > 0:
+                W[:, i].div_(cn.clamp_min(1e-6))
+
+        # periodic QR (best-effort)
+        if (step + 1) % args.sanger_qr_every == 0:
+            try:
+                W, _ = torch.linalg.qr(W, mode="reduced")
+                
+            except RuntimeError:
+                pass
+
+        # cheap variance metric (no QR)
+        denom = g_flat.pow(2).sum().clamp_min(1e-12)
+        var_ratio = ((W.T @ g_flat).pow(2).sum() / denom).clamp(min=0.0, max=1.0)
+        if True:
+            print(f"Subspace captures {(var_ratio * 100).item():.3f}% of gradient variance")
+
+    st["W"], st["step"] = W, step + 1
+
+    # ───── 4. logging / return ─────
+    if verbose:
+        dt = time.time() - start_t
+        print(f"[Sanger-SPSA-W] step={step:4d} "
+              f"loss={base_loss:.5f} "
+              f"var%={(var_ratio*100).item():.2f}  Δt={dt:.2f}s")
+
+    return dict(iterations=[step],
+                train_loss=[float(base_loss)],
+                elapsed_time=[time.time() - start_t],
+                grad_norm=[float(g_norm.item()) if torch.isfinite(g_norm) else float('nan')])
 
 
 
@@ -1552,7 +2420,7 @@ def train_step(model, args, batch_np, loss_closure, optimizer=None):
                 antithetic        = args.antithetic_sampling,
                 use_adaptive_step = False,
                 clip_grad_norm    = args.grad_clip,
-                cache_gradients   = args.cache_gradients,
+                cache_gradients   = True,
                 args              = args,
             )
             
@@ -1570,11 +2438,9 @@ def train_step(model, args, batch_np, loss_closure, optimizer=None):
                 antithetic        = args.antithetic_sampling,
                 use_adaptive_step = False,
                 clip_grad_norm    = args.grad_clip,
-                cache_gradients   = args.cache_gradients,
+                cache_gradients   = True,
                 args              = args,
             )
-            
-             
             
     elif args.solver=="2SPSA":
         with torch.no_grad():
@@ -1589,9 +2455,45 @@ def train_step(model, args, batch_np, loss_closure, optimizer=None):
                 antithetic        = args.antithetic_sampling,
                 use_adaptive_step = False,
                 clip_grad_norm    = args.grad_clip,
-                cache_gradients   = args.cache_gradients,
+                cache_gradients   = True,
                 args              = args,
             )
+            
+    elif args.solver=="BanditSPSA":
+        with torch.no_grad():
+            return BanditSPSA( 
+                model_params      = list(model.parameters()),
+                loss_fn           = loss_closure,
+                lr                = args.learning_rate,
+                epsilon           = args.epsilon,
+                iterations        = 1,
+                num_perturbations = args.num_perturbations,
+                distribution      = args.distribution,
+                antithetic        = args.antithetic_sampling,
+                use_adaptive_step = False,
+                clip_grad_norm    = args.grad_clip,
+                cache_gradients   = True,
+                args              = args,
+            ) 
+
+
+    elif args.solver=="Sanger-SPSA":
+        with torch.no_grad():
+            return SangerSPSA( 
+                model_params      = list(model.parameters()),
+                loss_fn           = loss_closure,
+                lr                = args.learning_rate,
+                epsilon           = args.epsilon,
+                iterations        = 1,
+                num_perturbations = args.num_perturbations,
+                distribution      = args.distribution,
+                antithetic        = args.antithetic_sampling,
+                use_adaptive_step = False,
+                clip_grad_norm    = args.grad_clip,
+                cache_gradients   = True,
+                args              = args,
+            ) 
+    
     else:
         raise Exception(f"no solver implemented named {args.solver}")
 
@@ -1712,7 +2614,7 @@ def train(args):
             else:
                 tok = CharTokenizer()
     
-    dtype = torch.float32 if args.solver=="BPTT" else torch.float16 # bptt in fp16 is unstable... try it but be weary.. vanishing/exploding grads await you 
+    dtype = torch.float32 if args.solver=="BPTT" else torch.float32 # torch.float16 # bptt in fp16 is unstable... try it but be weary.. vanishing/exploding grads await you 
 
     # ───────── Model construction (LSTM or DNC) ─────────
     embed = nn.Embedding(tok.vocab_size, args.input_size,
@@ -1796,7 +2698,8 @@ def train(args):
     if args.solver=="BPTT":
         bytes_per_param = 4  # float32 = 4 bytes
     else:
-        bytes_per_param = 2  # bfloat16 = 2 bytes
+        bytes_per_param = 4 
+        # bytes_per_param = 2  # bfloat16 = 2 bytes
         
     
     # Set up results dictionary
@@ -1947,7 +2850,7 @@ def train(args):
 
         print(f"  Parameters: {param_count:,} ({param_memory_mb:.2f} MB)")
 
-        if has_overfit_flag:
+        if True: #has_overfit_flag:
             if step_metrics['train_loss'][-1] < 0.1:
                 print(f"SUCCESS FINISHED! Overfit in iterations = {iteration}")
                 print(args)
@@ -1957,7 +2860,7 @@ def train(args):
                 # time.sleep(100000)
                 # return
                 break
-            elif step_metrics['train_loss'][-1] > 50. or math.isnan(step_metrics['train_loss'][-1]):
+            elif step_metrics['train_loss'][-1] > 7. or math.isnan(step_metrics['train_loss'][-1]):
                 print(f"FAILED DIVERGING!")
                 print(args)
                 total_iterations = iteration
@@ -2044,10 +2947,10 @@ def train(args):
         torch.cuda.empty_cache()   # frees cached blocks
         torch.cuda.ipc_collect()   # optional: reclaims inter-process buffers
 
-    print("="*50)
-    print("all results")
-    print(results)
-    print("="*50)
+    # print("="*50)
+    # print("all results")
+    # print(results)
+    # print("="*50)
     
     return results
     
@@ -2084,11 +2987,11 @@ def run_unittest(args):
             #                                 description="Medium dnc with BPTT with Adam"),
             
             # ========================= DNC cdrge-96 ================================= #
-            "tiny-cdrge96-default-dnc":  dict(model_size="tiny",   hidden_size=240,   num_heads=12,  head_size=20, memory_size=128, model_type="DNC",
-                                          learning_rate=0.01, epsilon=0.01,   #.01 for 1SPSA,  
-                                              micro_batch_size=int(batch_size/1), macro_batch_size=1,
-                                          num_perturbations=96,  antithetic=False,
-                                          description="Tiny dnc with cdrge@96"),
+            # "tiny-cdrge96-default-dnc":  dict(model_size="tiny",   hidden_size=240,   num_heads=12,  head_size=20, memory_size=128, model_type="DNC",
+            #                               learning_rate=0.01, epsilon=0.01,   #.01 for 1SPSA,  
+            #                                   micro_batch_size=int(batch_size/1), macro_batch_size=1,
+            #                               num_perturbations=96,  antithetic=False,
+            #                               description="Tiny dnc with cdrge@96"),
             # "small-cdrge96-default-dnc": dict(model_size="small",  hidden_size=1600,  num_heads=32,  head_size=50, memory_size=128, model_type="DNC",
             #                               learning_rate=0.001, epsilon=0.001,  micro_batch_size=int(batch_size/1), macro_batch_size=1,
             #                               num_perturbations=96,  antithetic=False,
@@ -2113,11 +3016,11 @@ def run_unittest(args):
             #                               description="XXLarge dnc with cdrge@96"),
         
             # ========================= DNC cdrge-512 ================================ #
-            "tiny-cdrge512-default-dnc":  dict(model_size="tiny",   hidden_size=240,   num_heads=12,  head_size=20, memory_size=128, model_type="DNC",
-                                           learning_rate=0.01, epsilon=0.01, #.1 for 1SPSA,  
-                                               micro_batch_size=int(batch_size/1), macro_batch_size=1,
-                                           num_perturbations=512, antithetic=False,
-                                           description="Tiny dnc with cdrge@512"),
+            # "tiny-cdrge512-default-dnc":  dict(model_size="tiny",   hidden_size=240,   num_heads=12,  head_size=20, memory_size=128, model_type="DNC",
+            #                                learning_rate=0.01, epsilon=0.01, #.1 for 1SPSA,  
+            #                                    micro_batch_size=int(batch_size/1), macro_batch_size=1,
+            #                                num_perturbations=512, antithetic=False,
+            #                                description="Tiny dnc with cdrge@512"),
             # "small-cdrge512-default-dnc": dict(model_size="small",  hidden_size=1600,  num_heads=32,  head_size=50, memory_size=128, model_type="DNC",
             #                                learning_rate=0.01, epsilon=0.01,   micro_batch_size=int(batch_size/1), macro_batch_size=1,
             #                                num_perturbations=512, antithetic=False,
@@ -2144,9 +3047,9 @@ def run_unittest(args):
             ### LSTM TESTS
             # ========================= LSTM BPTT ===================================== #
             
-            "tiny-bptt-default-lstm":   dict(model_size="tiny",   hidden_size=240,   num_heads=12,  head_size=20, model_type="LSTM",
-                                        solver="BPTT", use_adam=True, learning_rate=0.01, epsilon=0.01,   micro_batch_size=int(batch_size/1), macro_batch_size=1,
-                                        description="Tiny lstm with BPTT"),
+            # "tiny-bptt-default-lstm":   dict(model_size="tiny",   hidden_size=240,   num_heads=12,  head_size=20, model_type="LSTM",
+            #                             solver="BPTT", use_adam=True, learning_rate=0.01, epsilon=0.01,   micro_batch_size=int(batch_size/1), macro_batch_size=1, 
+            #                             description="Tiny lstm with BPTT"),
             # "small-bptt-default-lstm":  dict(model_size="small",  hidden_size=1600,  num_heads=32,  head_size=50, model_type="LSTM",
             #                             solver="BPTT", use_adam=True, learning_rate=0.01, epsilon=0.01,  micro_batch_size=int(batch_size/1), macro_batch_size=1,
             #                             description="Small lstm with BPTT"),
@@ -2155,10 +3058,24 @@ def run_unittest(args):
             #                             description="Medium lstm with BPTT - optimized for GPU memory constraints"),
             
             # ========================= LSTM cdrge-96 ================================= #
-            "tiny-cdrge96-default-lstm":  dict(model_size="tiny",   hidden_size=240,   num_heads=12,  head_size=20,model_type="LSTM",
-                                          learning_rate=0.1, epsilon=0.1,    micro_batch_size=int(batch_size/1), macro_batch_size=1,
-                                          num_perturbations=96,  antithetic=False,
-                                          description="Tiny lstm with cdrge@96"),
+            "tiny-banditspsa-96-default-lstm":  dict(model_size="tiny",   hidden_size=240,   num_heads=12,  head_size=20, model_type="LSTM",
+                                          learning_rate=0.001, epsilon=0.001,    micro_batch_size=int(batch_size/1), macro_batch_size=1,
+                                          num_perturbations=96,  antithetic=False, seed=42, solver="BanditSPSA", beta1=0.0, beta2=0.0, 
+                                          use_probe_preconditioning=False, description="Tiny lstm with cdrge@96"),
+            # "tiny-cdrge96-default-lstm":  dict(model_size="tiny",   hidden_size=2400,   num_heads=12,  head_size=20,model_type="LSTM",
+            #                               learning_rate=0.1, epsilon=0.1,    micro_batch_size=int(batch_size/1), macro_batch_size=1,
+            #                               num_perturbations=96,  antithetic=False, seed=42, solver="1SPSA", beta1=0.0, beta2=0.0, 
+            #                               use_probe_preconditioning=False, description="Tiny lstm with cdrge@96"),
+
+        
+            # "tiny-cdrge96-default-lstm-with-rmsprop":  dict(model_size="tiny",   hidden_size=2400,   num_heads=12,  head_size=20,model_type="LSTM",
+            #                               learning_rate=0.1, epsilon=0.1,    micro_batch_size=int(batch_size/1), macro_batch_size=1,
+            #                               num_perturbations=96,  antithetic=False, seed=42, solver="1SPSA", beta1=0.0, beta2=0.1, 
+            #                               use_probe_preconditioning=False, description="Tiny lstm with cdrge@96"),
+            # "tiny-cdrge96-default-lstm-with-rmsprop-probe-precond":  dict(model_size="tiny",   hidden_size=2400,   num_heads=12,  head_size=20,model_type="LSTM",
+            #                               learning_rate=0.1, epsilon=0.1,    micro_batch_size=int(batch_size/1), macro_batch_size=1,
+            #                               num_perturbations=96,  antithetic=False, seed=42, solver="1SPSA", beta1=0.0, beta2=0.1, 
+            #                               use_probe_preconditioning=True, description="Tiny lstm with cdrge@96"),
             # "small-cdrge96-default-lstm": dict(model_size="small",  hidden_size=1600,  num_heads=32,  head_size=50,model_type="LSTM",
             #                               learning_rate=0.01, epsilon=0.01, micro_batch_size=int(batch_size/1), macro_batch_size=1,
             #                               num_perturbations=96,  antithetic=False,
@@ -2177,10 +3094,10 @@ def run_unittest(args):
             #                               description="XLarge lstm with cdrge@96"),
         
             # ========================= LSTM cdrge-512 ================================ #
-            "tiny-cdrge512-default-lstm":  dict(model_size="tiny",   hidden_size=240,   num_heads=12,  head_size=20,model_type="LSTM",
-                                           learning_rate=0.01, epsilon=0.01,   micro_batch_size=int(batch_size/1), macro_batch_size=1,
-                                           num_perturbations=512, antithetic=False,
-                                           description="Tiny lstm with cdrge@512"),
+            # "tiny-cdrge512-default-lstm":  dict(model_size="tiny",   hidden_size=240,   num_heads=12,  head_size=20,model_type="LSTM",
+            #                                learning_rate=0.01, epsilon=0.01,   micro_batch_size=int(batch_size/1), macro_batch_size=1,
+            #                                num_perturbations=512, antithetic=False, solver="1SPSA", 
+            #                                description="Tiny lstm with cdrge@512"),
             # "small-cdrge512-default-lstm": dict(model_size="small",  hidden_size=1600,  num_heads=32,  head_size=50,model_type="LSTM",
             #                                learning_rate=0.01, epsilon=0.01,  micro_batch_size=int(batch_size/1), macro_batch_size=1,
             #                                num_perturbations=512, antithetic=False,
@@ -2323,8 +3240,7 @@ def get_argument_parser():
 
     # Optimization settings
     parser.add_argument("--solver", type=str, default="1SPSA",
-                        choices=["BPTT", "1SPSA", "1.5-SPSA", "2SPSA"] )
-    
+                        choices=["BPTT", "1SPSA", "1.5-SPSA", "2SPSA", "BanditSPSA", "Sanger-SPSA"] )
     parser.add_argument("--distribution", type=str, default="rad",
                         choices=["rad", "normal", "uniform"])
     parser.add_argument("--epsilon", type=float, default=0.01)
@@ -2333,19 +3249,28 @@ def get_argument_parser():
     parser.add_argument("--num_perturbations", type=int, default=20)
     parser.add_argument("--antithetic_sampling", action="store_true")
     parser.add_argument("--use_adaptive_step", action="store_true",
-                        help="Use adaptive step sizes for FDRAS optimization")
+                        help="Use adaptive step sizes for FDRAS optimization") 
     parser.add_argument("--grad_clip", type=float, default=0.0)
     parser.add_argument("--beta1", type=float, default=0.0, help="for momentum")
     parser.add_argument("--beta2", type=float, default=0.0, help="for RMSProp-style variance")
     parser.add_argument("--weight_decay", type=float, default=0.0, help="l2 weight decay")
+    parser.add_argument("--use_probe_preconditioning", action="store_true", default=False,
+                        help="Use the RMSProp g^2 EMA to precondition the probe.")
     parser.add_argument("--use_adam", action="store_true", default=False,
                         help="Use Adam optimizer vs. vanilla SGD")
     parser.add_argument("--overfit_to_one_batch_flag", action="store_true", default=False,
                         help="Use the same batch for all training iterations")
-
+    parser.add_argument("--bandit_softmax_temperature", type=float, default=0.0001)
+    parser.add_argument("--sanger_rank", type=int, default=1)
+    parser.add_argument("--beta_eigen_sanger", type=float, default=0.1, help="for momentum")
+    parser.add_argument("--sanger_qr_every", type=int, default=10000000)
+    parser.add_argument("--warmup_iters", type=int, default=100)
+    parser.add_argument("--alpha_eye_scalar", type=float, default=1.)
+    
+    
     # Curriculum learning
     parser.add_argument("--curriculum", action="store_true")
-    parser.add_argument("--curriculum_steps", type=int, default=5)
+    parser.add_argument("--curriculum_steps", type=int, default=5) 
 
 
     # Experiment tracking
@@ -2435,6 +3360,16 @@ def main() -> None:
             status = results["status"]
             iters  = int(results["train_metrics"]["iterations"][-1])
             filename = f"{status}_{base_name}_{iters}.json"
+            if hasattr(args, "coordinate_momentum"):
+                args.coordinate_momentum = None
+            if hasattr(args, "coordinate_variance"):
+                args.coordinate_variance = None
+            if hasattr(args, "_state"):
+                # print(args._state)
+                args._state = None
+                
+            
+            
             payload = {
                 "status": status,
                 "seed": int(args.seed),
@@ -2446,6 +3381,7 @@ def main() -> None:
                 "wandb_run_name": run_prefix,
                 "args": vars(args),
             }
+            
             json.dump(payload, open(out_root / filename, "w"), indent=2)
             print(f"[INFO] Success → {filename} status {status} iters {iters}")
             return
