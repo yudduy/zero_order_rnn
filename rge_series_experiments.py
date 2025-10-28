@@ -13,11 +13,10 @@ import string
 import time
 import math
 import json
+import warnings
 from typing import Dict, List, Tuple, Optional, Union, Any
 
 import numpy as np
-import torch
-from flashrnn.flashrnn import flashrnn
 import torch
 import torch.nn as nn
 import torch.optim as optim

@@ -1,0 +1,29 @@
+# Requirements for zero_order_rnn - CPU-only version for Farmshare
+# Based on README.md but adapted for CPU-only compute
+
+# Core dependencies
+torch==2.4.0
+torchvision==0.19.0
+torchaudio==2.4.0
+
+# Data and tokenization
+transformers
+datasets
+tiktoken
+
+# Utilities
+timeout_decorator
+matplotlib
+numpy
+
+# Optional (for logging - disabled by default)
+# wandb
+# pynvml  # GPU monitoring - not needed on CPU
+# neptune
+
+# File locking
+filelock>=3.12
+
+# Testing and profiling
+psutil  # For CPU/memory monitoring
+pytest  # For running tests
